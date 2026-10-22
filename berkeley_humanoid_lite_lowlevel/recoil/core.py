@@ -223,9 +223,15 @@ class Bus:
                 filter_function: int | None = None,
                 timeout=None
                 ) -> CANFrame | None:
+        # Keep ``timeout`` as a deadline for the whole filtered receive.  Without
+        # this, unrelated CAN traffic restarts the timeout on every iteration and
+        # can make a nominally timed read block forever.
+        deadline = None if timeout is None else time.monotonic() + timeout
+        receive_timeout = timeout
+
         while True:
             try:
-                msg = self.__bus.recv(timeout=timeout)
+                msg = self.__bus.recv(timeout=receive_timeout)
             except can.exceptions.CanOperationError as e:
                 print("<CANReceive> error:", e)
                 return None
@@ -238,6 +244,10 @@ class Bus:
 
             if msg.is_error_frame:
                 print(f"{time.time()} <{self.channel}> Error Frame: {msg.arbitration_id}, {msg.dlc}")
+                if deadline is not None:
+                    receive_timeout = deadline - time.monotonic()
+                    if receive_timeout <= 0.0:
+                        return None
                 continue
 
             frame = CANFrame(
@@ -246,11 +256,19 @@ class Bus:
                 size=msg.dlc,
                 data=msg.data
             )
-            if filter_device_id:
+            if filter_device_id is not None:
                 if frame.device_id != filter_device_id:
+                    if deadline is not None:
+                        receive_timeout = deadline - time.monotonic()
+                        if receive_timeout <= 0.0:
+                            return None
                     continue
-            if filter_function:
+            if filter_function is not None:
                 if frame.func_id != filter_function:
+                    if deadline is not None:
+                        receive_timeout = deadline - time.monotonic()
+                        if receive_timeout <= 0.0:
+                            return None
                     continue
 
             return frame
@@ -465,8 +483,12 @@ class Bus:
     def write_position_target(self, device_id: int, value: float):
         self._write_parameter_f32(device_id, Parameter.POSITION_CONTROLLER_POSITION_TARGET, value)
 
-    def read_position_measured(self, device_id: int) -> float | None:
-        return self._read_parameter_f32(device_id, Parameter.POSITION_CONTROLLER_POSITION_MEASURED)
+    def read_position_measured(self, device_id: int, timeout=None) -> float | None:
+        return self._read_parameter_f32(
+            device_id,
+            Parameter.POSITION_CONTROLLER_POSITION_MEASURED,
+            timeout,
+        )
 
     def read_torque_filter_alpha(self, device_id: int) -> float | None:
         return self._read_parameter_f32(device_id, Parameter.POSITION_CONTROLLER_TORQUE_FILTER_ALPHA)

@@ -11,7 +11,7 @@ over UDP for robot control modes and movement velocities.
 import threading
 from typing import Dict
 
-from inputs import get_gamepad
+from inputs import UnpluggedError, get_gamepad
 
 
 class XInputEntry:
@@ -80,7 +80,10 @@ class Se2Gamepad:
             self.advance()
 
     def advance(self) -> None:
-        events = get_gamepad()
+        try:
+            events = get_gamepad()
+        except UnpluggedError:
+            return
 
         # update all events from the joystick
         for event in events:

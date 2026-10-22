@@ -1,6 +1,7 @@
 # Copyright (c) 2025, The Berkeley Humanoid Lite Project Developers.
 
 import time
+from pathlib import Path
 
 from omegaconf import OmegaConf
 import numpy as np
@@ -24,15 +25,15 @@ def linear_interpolate(start: np.ndarray, end: np.ndarray, percentage: float) ->
 
 
 class Humanoid:
-    def __init__(self):
+    def __init__(self, start_peripherals: bool = True):
 
         # self.left_arm_transport = recoil.Bus("can0")
         # self.right_arm_transport = recoil.Bus("can1")
-        # self.left_leg_transport = recoil.Bus("can2")
-        # self.right_leg_transport = recoil.Bus("can3")
+        self.left_leg_transport = recoil.Bus("can2")
+        self.right_leg_transport = recoil.Bus("can3")
 
-        self.left_leg_transport = recoil.Bus("can0")
-        self.right_leg_transport = recoil.Bus("can1")
+        #self.left_leg_transport = recoil.Bus("can0")
+        #self.right_leg_transport = recoil.Bus("can1")
 
         self.joints = [
             # (self.left_arm_transport,   1,  "left_shoulder_pitch_joint"     ),  # noqa: E241
@@ -62,12 +63,15 @@ class Humanoid:
             (self.right_leg_transport,  14, "right_ankle_roll_joint"        ),  # noqa: E241
         ]
 
-        self.imu = SerialImu(baudrate=Baudrate.BAUD_460800)
-        self.imu.run_forever()
+        self.imu = None
+        self.command_controller = None
+        if start_peripherals:
+            self.imu = SerialImu(baudrate=Baudrate.BAUD_460800)
+            self.imu.run_forever()
 
-        # Start joystick thread
-        self.command_controller = Se2Gamepad()
-        self.command_controller.run()
+            # Start joystick thread
+            self.command_controller = Se2Gamepad()
+            self.command_controller.run()
 
         self.state = State.IDLE
         self.next_state = State.IDLE
@@ -111,12 +115,16 @@ class Humanoid:
         self.init_percentage = 0.0
         self.starting_positions = np.zeros_like(self.joint_position_target, dtype=np.float32)
 
-        config_path = "calibration.yaml"
-        with open(config_path, "r") as f:
-            config = OmegaConf.load(f)
-        position_offsets = np.array(config.get("position_offsets", None))
-        assert position_offsets.shape[0] == len(self.joints)
-        self.position_offsets[:] = position_offsets
+        config_path = Path(__file__).resolve().parents[2] / "calibration.yaml"
+        if config_path.exists():
+            with open(config_path, "r") as f:
+                config = OmegaConf.load(f)
+            position_offsets = np.array(config.get("position_offsets", None))
+            if position_offsets is None or position_offsets.shape[0] != len(self.joints):
+                raise ValueError(f"Invalid calibration data in {config_path}: expected {len(self.joints)} offsets, got {None if position_offsets is None else position_offsets.shape[0]}")
+            self.position_offsets[:] = position_offsets
+        else:
+            print(f"Warning: {config_path} not found; using zero joint offsets.")
 
     def enter_damping(self):
         self.joint_kp = np.zeros((len(self.joints),), dtype=np.float32)
@@ -148,8 +156,10 @@ class Humanoid:
         print("Motors enabled")
 
     def stop(self):
-        self.imu.stop()
-        self.command_controller.stop()
+        if self.imu is not None:
+            self.imu.stop()
+        if self.command_controller is not None:
+            self.command_controller.stop()
 
         for entry in self.joints:
             bus, device_id, _ = entry

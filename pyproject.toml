@@ -15,7 +15,7 @@ maintainers = [
     { name = "-T.K.-" },
 ]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.11"
 license = "MIT"
 keywords = ["robotics", "lowlevel"]
 classifiers = [
@@ -23,11 +23,26 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
 ]
 dependencies = [
+    "cc.udp",
+    "inputs",
+    "numpy==1.26.1",
+    "omegaconf",
+    "onnxruntime",
     "psutil",
+    "pyserial",
+    "python-can",
+    "pynput",
+    "pyyaml",
+    "scipy",
+    "tables",
+    "torch==2.5.0a0+872d972e41.nv24.8",
 ]
 
 [project.urls]
 repository = "https://github.com/HybridRobotics/Berkeley-Humanoid-Lite-Lowlevel"
+
+[tool.uv.sources]
+torch = { path = "wheels/torch-2.5.0a0+872d972e41.nv24.8-cp310-cp310-linux_aarch64.whl" }
 
 [tool.setuptools]
 packages = ["berkeley_humanoid_lite_lowlevel"]

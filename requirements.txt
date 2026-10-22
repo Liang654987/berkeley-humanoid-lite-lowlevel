@@ -1,7 +1,12 @@
+cc.udp
+inputs
+omegaconf
+psutil
 pyserial
 python-can
-cc.udp
 onnxruntime
-inputs
 pynput
+pyyaml
+scipy
 tables
+numpy

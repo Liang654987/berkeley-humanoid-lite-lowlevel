@@ -50,10 +50,12 @@ Because the joint actuators only have single encoder on the motor shaft, we need
 Run the following command to start the calibration:
 
 ```bash
-python3 ./berkeley_humanoid_lite_lowlevel/robot/calibrate_joints.py
+python3 ./scripts/calibrate_joints.py
 ```
 
-After the script is launched and running, manually move the robot joints to the mechanical position limits. After all the joints are moved, press `q` or the `B` button on the joystick to quit the calibration.
+After the script is launched and running, manually move the robot joints to the mechanical position limits. After all the joints are moved, press `q` or `Enter` to stop sampling and save the calibration. Pressing `Ctrl+C` cancels without overwriting the calibration file.
+
+Each actuator read has a timeout. If an actuator does not respond, the script reports its joint name, CAN channel, and device ID instead of waiting indefinitely. Check the reported CAN interface and actuator before running the calibration again.
 
 The calibration data will be saved in the `./calibration.yaml` file.
 
@@ -74,4 +76,3 @@ Press `LB` + `A` to enter RL init mode. Then, press `RB` + `A` to enter RL runni
 At any time, press `B` or the thumb buttons to exit RL mode. The joints will enter passive damping mode.
 
 Press `Ctrl` + `C` to terminate the controller. Upon first termination, the joints will enter passive damping mode. Press `Ctrl` + `C` again to completely stop the controller, which joints will return to unpowered idle state.
-

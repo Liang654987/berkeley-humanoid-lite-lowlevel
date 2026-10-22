@@ -4,8 +4,6 @@ import time
 import struct
 import threading
 
-import numpy as np
-from loop_rate_limiters import RateLimiter
 import serial
 
 
@@ -197,7 +195,7 @@ class SerialImu:
             #     return 921600
         return 0
 
-    def __init__(self, port: str = "/dev/ttyUSB0", baudrate: int = Baudrate.BAUD_115200, read_timeout=4):
+    def __init__(self, port: str = "/dev/ttyUSB0", baudrate: int = Baudrate.BAUD_460800, read_timeout=4):
         self.port: str = port
         self.baud: int = baudrate
         self.read_timeout: int = read_timeout
@@ -216,15 +214,15 @@ class SerialImu:
         # Celcius degree
         self.temperature: float = 0.0
         # (x, y, z) m/s^2
-        self.acceleration: np.ndarray = np.zeros(3, dtype=np.float32)
+        self.acceleration: list[float] = [0.0] * 3
         # (x, y, z) deg/s
-        self.angular_velocity: np.ndarray = np.zeros(3, dtype=np.float32)
+        self.angular_velocity: list[float] = [0.0] * 3
         # (yaw, pitch, roll) deg
-        self.angle: np.ndarray = np.zeros(3, dtype=np.float32)
+        self.angle: list[float] = [0.0] * 3
         # (x, y, z) μT
-        self.magnetic_field: np.ndarray = np.zeros(3, dtype=np.float32)
+        self.magnetic_field: list[float] = [0.0] * 3
         # (w, x, y, z)
-        self.quaternion: np.ndarray = np.zeros(4, dtype=np.float32)
+        self.quaternion: list[float] = [0.0] * 4
 
         # self.__debug_last_time: float = time.perf_counter_ns()
 
@@ -237,12 +235,14 @@ class SerialImu:
         if start != 0x55:
             return
         frame = self.ser.read(self.FRAME_LENGTH - 1)
+        if len(frame) != self.FRAME_LENGTH - 1:
+            return
 
         frame_type, data1, data2, data3, data4, sumcrc = struct.unpack("<BhhhhB", frame)
 
         # print(type, data1, data2, data3, data4, sumcrc)
         if frame_type == FrameType.TIME:
-            _, year, month, day, hour, minute, second, millisecond = struct.unpack("<BBBBhB", frame)
+            return
 
         elif frame_type == FrameType.ACCELERATION:
             self.acceleration[0] = data1 * 16.0 / 32768.0  # g
@@ -431,7 +431,7 @@ if __name__ == "__main__":
 
     imu.run_forever()
 
-    rate = RateLimiter(100)
+    output_period = 0.01
 
     print("IMU reader started")
 
@@ -440,7 +440,7 @@ if __name__ == "__main__":
             print(f"ax: {imu.acceleration[0]:.2f}\tay: {imu.acceleration[1]:.2f}\taz: {imu.acceleration[2]:.2f}", end="\t")
             print(f"gx: {imu.angular_velocity[0]:.2f}\tgy: {imu.angular_velocity[1]:.2f}\tgz: {imu.angular_velocity[2]:.2f}", end="\t")
             print(f"qw: {imu.quaternion[0]:.2f}\tqx: {imu.quaternion[1]:.2f}\tqy: {imu.quaternion[2]:.2f}\tqz: {imu.quaternion[3]:.2f}")
-            rate.sleep()
+            time.sleep(output_period)
     except KeyboardInterrupt:
         imu.stop()
         imu.ser.close()

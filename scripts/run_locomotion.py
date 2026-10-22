@@ -13,7 +13,7 @@ cfg = Cfg.from_arguments()
 
 print(f"Policy frequency: {1 / cfg.policy_dt} Hz")
 
-udp = UDP(("0.0.0.0", 11000), ("172.28.0.5", 11000))
+udp = UDP(("0.0.0.0", 11000), ("192.168.3.87", 11000))
 
 
 # Initialize and start policy controller
