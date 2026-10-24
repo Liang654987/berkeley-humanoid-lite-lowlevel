@@ -43,6 +43,34 @@ class XInputEntry:
     BTN_START = "BTN_START"
 
 
+# Raw event names reported by the Xiaoji controller mapped to the standard
+# XInput names consumed by Se2Gamepad.
+XIAOJI_EVENT_REMAP = {
+    "BTN_EAST": "BTN_SOUTH",
+    "BTN_C": "BTN_EAST",
+    "BTN_SOUTH": "BTN_WEST",
+    "BTN_NORTH": "BTN_NORTH",
+    "ABS_RZ": "ABS_RY",
+    "ABS_Z": "ABS_RX",
+    "BTN_START": "BTN_THUMBR",
+    "ABS_Y": "ABS_Y",
+    "ABS_X": "ABS_X",
+    "BTN_SELECT": "BTN_THUMBL",
+    "ABS_HAT0X": "ABS_HAT0X",
+    "ABS_HAT0Y": "ABS_HAT0Y",
+    "BTN_WEST": "BTN_TL",
+    "ABS_RX": "ABS_Z",
+    "BTN_TL": "BTN_TL2",
+    "BTN_Z": "BTN_TR",
+    "ABS_RY": "ABS_RZ",
+    "BTN_TR": "BTN_TR2",
+    "BTN_TL2": "BTN_SELECT",
+    "BTN_TR2": "BTN_START",
+    "BTN_THUMBL": "BTN_C",
+    "BTN_MODE": "BTN_MODE",
+}
+
+
 class Se2Gamepad:
     def __init__(self,
                  stick_sensitivity: float = 1.0,
@@ -87,7 +115,8 @@ class Se2Gamepad:
 
         # update all events from the joystick
         for event in events:
-            self._states[event.code] = event.state
+            mapped_code = XIAOJI_EVENT_REMAP.get(event.code, event.code)
+            self._states[mapped_code] = event.state
 
         self._update_command_buffer()
 

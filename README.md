@@ -43,6 +43,13 @@ To broadcast the joystick commands to other running nodes, run the following com
 python ./berkeley_humanoid_lite_lowlevel/policy/udp_joystick.py
 ```
 
+The Xiaoji controller event mapping is applied by
+`berkeley_humanoid_lite_lowlevel/policy/gamepad.py`, including the `ABS_*`
+axis remapping. The `evdev-keycode-remapper` project uses Linux hwdb
+`KEYBOARD_KEY_*` entries and is intended for key events; it cannot remap these
+absolute joystick axes. The runtime mapping is therefore required for the
+controller's axes and also keeps the mapping in the project configuration.
+
 ### Joint Calibration
 
 Because the joint actuators only have single encoder on the motor shaft, we need to calibrate the zero position of the joints after each power cycle.

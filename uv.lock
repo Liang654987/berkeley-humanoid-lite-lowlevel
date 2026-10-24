@@ -24,6 +24,7 @@ source = { editable = "." }
 dependencies = [
     { name = "cc-udp" },
     { name = "inputs" },
+    { name = "loop-rate-limiters" },
     { name = "numpy" },
     { name = "omegaconf" },
     { name = "onnxruntime" },
@@ -41,6 +42,7 @@ dependencies = [
 requires-dist = [
     { name = "cc-udp" },
     { name = "inputs" },
+    { name = "loop-rate-limiters" },
     { name = "numpy", specifier = "==1.26.1" },
     { name = "omegaconf" },
     { name = "onnxruntime" },
@@ -235,6 +237,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/df/bf/f7da0350254c0ed7c72f3e33cef02e048281fec7ecec5f032d4aac52226b/jinja2-3.1.6.tar.gz", hash = "sha256:0137fb05990d35f1275a587e9aee6d56da821fc83491a0fb838183be43f66d6d", size = 245115, upload-time = "2025-03-05T20:05:02.478Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl", hash = "sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67", size = 134899, upload-time = "2025-03-05T20:05:00.369Z" },
+]
+
+[[package]]
+name = "loop-rate-limiters"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c7/dc/ebbe468e7a71073879b322968a02e37594343ca2cc4b3ba65baf4db60adb/loop_rate_limiters-1.2.0.tar.gz", hash = "sha256:7187ec1f76f282ee7166d85c8e29eb13dd850422577decaf7e6bfc803173b421", size = 35581, upload-time = "2025-08-13T12:46:29.235Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e2/6d/d56be57340baf2e6f6361386f4c21b8b5e001251c64af954787f8d01ec78/loop_rate_limiters-1.2.0-py3-none-any.whl", hash = "sha256:482f720f409e05dfca8b7b63df180217afa9a51564def681853cb7370a020b74", size = 10917, upload-time = "2025-08-13T12:46:26.7Z" },
 ]
 
 [[package]]

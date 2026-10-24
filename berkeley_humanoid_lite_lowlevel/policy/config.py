@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
@@ -56,14 +57,15 @@ class Cfg(DictConfig):
         parser.add_argument(
             "--config",
             type=str,
-            default="./configs/policy_biped.yaml",
+            default=str(Path(__file__).resolve().parents[2] / "configs" / "policy_biped_50hz.yaml"),
             help="Path to the configuration file",
         )
         args = parser.parse_args()
 
         print("Loading config file from ", args.config)
 
-        with open(args.config, "r") as f:
+        config_path = Path(args.config).expanduser().resolve()
+        with config_path.open("r") as f:
             cfg = OmegaConf.load(f)
 
         return cfg
