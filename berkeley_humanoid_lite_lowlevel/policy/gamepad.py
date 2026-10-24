@@ -81,6 +81,7 @@ class Se2Gamepad:
 
         self._stopped = threading.Event()
         self._run_forever_thread = None
+        self._last_mode_switch = 0
 
         self.reset()
 
@@ -93,6 +94,7 @@ class Se2Gamepad:
 
     def reset(self) -> None:
         self._states = {key: 0 for key in XInputEntry.__dict__.values()}
+        self._last_mode_switch = 0
 
     def stop(self) -> None:
         print("Gamepad stopping...")
@@ -147,6 +149,15 @@ class Se2Gamepad:
             mode_switch = 1
 
         self.commands["mode_switch"] = mode_switch
+        if mode_switch != self._last_mode_switch:
+            mode_names = {
+                0: "no mode switch",
+                1: "idle mode",
+                2: "RL init mode",
+                3: "RL control mode",
+            }
+            print(f"Gamepad: entered {mode_names[mode_switch]}.")
+            self._last_mode_switch = mode_switch
 
 
 if __name__ == "__main__":
