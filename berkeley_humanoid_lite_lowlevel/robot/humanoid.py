@@ -239,6 +239,42 @@ class Humanoid:
         self.update_joint_group(5, 11)
 
     def reset(self):
+        initial_positions = np.empty(len(self.joints), dtype=np.float32)
+        missing_joints = []
+
+        # Read every joint while the motors are still in damping mode.  Never
+        # enter position mode with the zero-filled startup values above.
+        for joint_id, (bus, device_id, joint_name) in enumerate(self.joints):
+            position_measured = bus.read_position_measured(
+                device_id,
+                timeout=0.1,
+            )
+            if position_measured is None or not np.isfinite(position_measured):
+                missing_joints.append(
+                    f"{joint_name} ({bus.channel}, device ID {device_id})"
+                )
+                continue
+
+            initial_positions[joint_id] = (
+                position_measured * self.joint_axis_directions[joint_id]
+                - self.position_offsets[joint_id]
+            )
+
+        if missing_joints:
+            raise RuntimeError(
+                "Cannot initialize: no valid position feedback from "
+                + ", ".join(missing_joints)
+            )
+
+        self.joint_position_measured[:] = initial_positions
+        self.joint_velocity_measured.fill(0.0)
+        self.joint_position_target[:] = initial_positions
+        self.starting_positions[:] = initial_positions
+
+        # Preload the measured positions as targets before position mode can be
+        # selected.  In damping mode these messages cannot produce motion.
+        self.update_joints()
+
         obs = self.get_observations()
         return obs
 
