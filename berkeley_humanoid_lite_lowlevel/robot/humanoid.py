@@ -263,6 +263,18 @@ class Humanoid:
                     self.init_percentage = 0.0
 
             case State.RL_INIT:
+                if self.next_state == State.IDLE:
+                    print("Switching to idle mode")
+                    self.state = State.IDLE
+
+                    for entry in self.joints:
+                        bus, device_id, _ = entry
+                        bus.set_mode(device_id, recoil.Mode.DAMPING)
+
+                    self.joint_position_target[:] = self.joint_position_measured[:]
+                    self.update_joints()
+                    return self.get_observations()
+
                 print(f"init: {self.init_percentage:.2f}")
                 if self.init_percentage < 1.0:
                     self.init_percentage += 1 / 100.0

@@ -46,24 +46,31 @@ class XInputEntry:
 # Raw event names reported by the Xiaoji controller mapped to the standard
 # XInput names consumed by Se2Gamepad.
 XIAOJI_EVENT_REMAP = {
+    ##四个圆键
     "BTN_EAST": "BTN_SOUTH",
     "BTN_C": "BTN_EAST",
     "BTN_SOUTH": "BTN_WEST",
     "BTN_NORTH": "BTN_NORTH",
+    ##右摇杆
     "ABS_RZ": "ABS_RY",
     "ABS_Z": "ABS_RX",
     "BTN_START": "BTN_THUMBR",
+    ##左摇杆
     "ABS_Y": "ABS_Y",
     "ABS_X": "ABS_X",
     "BTN_SELECT": "BTN_THUMBL",
+    ##十字键
     "ABS_HAT0X": "ABS_HAT0X",
     "ABS_HAT0Y": "ABS_HAT0Y",
+    ##左肩键
     "BTN_WEST": "BTN_TL",
     "ABS_RX": "ABS_Z",
     "BTN_TL": "BTN_TL2",
+    ##右肩键
     "BTN_Z": "BTN_TR",
     "ABS_RY": "ABS_RZ",
     "BTN_TR": "BTN_TR2",
+    ##其他
     "BTN_TL2": "BTN_SELECT",
     "BTN_TR2": "BTN_START",
     "BTN_THUMBL": "BTN_C",
