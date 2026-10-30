@@ -287,6 +287,32 @@ def set_group_mode(robot: Humanoid, group: list[int], mode: int) -> None:
         bus.set_mode(device_id, mode)
 
 
+def hold_group_at_current_position(
+    robot: Humanoid,
+    group: list[int],
+    starts: dict[int, tuple[float, float]],
+) -> dict[int, tuple[float, float]]:
+    commands = {joint_id: starts[joint_id][1] for joint_id in group}
+    try:
+        feedback, timeout_count = exchange_group(robot, group, commands)
+    except CommunicationError as error:
+        raise MotionError(
+            reason=f"连续{error.attempts}次未收到PDO反馈",
+            group=group,
+            fault_joint_ids=error.missing_joint_ids,
+            step=0,
+            commands=commands,
+            feedback=starts,
+            timeout_count=error.timeout_count,
+            communication_failure=True,
+        ) from error
+
+    set_group_mode(robot, group, recoil.Mode.POSITION)
+    if timeout_count:
+        print(f"预加载当前位置时发生 {timeout_count} 次超时重试")
+    return feedback
+
+
 def emergency_damping(robot: Humanoid, joint_ids: list[int]) -> list[str]:
     errors = []
     for joint_id in dict.fromkeys(joint_ids):
@@ -297,6 +323,27 @@ def emergency_damping(robot: Humanoid, joint_ids: list[int]) -> list[str]:
         except Exception as error:
             errors.append(f"{bus.channel} ID {device_id}: {error}")
     return errors
+
+
+def enter_idle(robot: Humanoid) -> list[str]:
+    errors = []
+    for bus, device_id, _ in robot.joints:
+        try:
+            bus.feed(device_id)
+            bus.set_mode(device_id, recoil.Mode.IDLE)
+        except Exception as error:
+            errors.append(f"{bus.channel} ID {device_id}: {error}")
+    return errors
+
+
+def wait_for_exit_interrupt() -> int:
+    print("所有电机已切换到 IDLE（不保持位置）。再次按 Ctrl+C 退出脚本。")
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\nExiting.")
+        return 130
 
 
 def run_group(
@@ -559,12 +606,20 @@ def run_initialize_mode(
     all_results = []
 
     for group_number, group in enumerate(groups, start=1):
+        # Damping mode lets a joint move while its current position is sampled.
+        # Preload that position and hold it before checking feedback stability.
+        starts = {
+            joint_id: read_position(robot, joint_id)
+            for joint_id in group
+        }
+        hold_group_at_current_position(robot, group, starts)
         starts = read_stable_group(robot, group)
         print(f"\nGroup {group_number}/{len(groups)}")
         print_group_plan(robot, group, starts, args.max_travel)
         if not confirm_motion():
             break
 
+        interrupted = False
         try:
             results = run_group(
                 robot,
@@ -577,8 +632,13 @@ def run_initialize_mode(
             if not all(result["passed"] for result in results):
                 print("Group failed; remaining groups will not be started.")
                 break
+        except KeyboardInterrupt:
+            interrupted = True
+            set_group_mode(robot, group, recoil.Mode.IDLE)
+            raise
         finally:
-            emergency_damping(robot, group)
+            if not interrupted:
+                emergency_damping(robot, group)
 
     return all_results
 
@@ -588,6 +648,7 @@ def main() -> int:
     robot = Humanoid(start_peripherals=False)
     groups = []
     initialize_mode = args.mode == "initialize"
+    idle_requested = False
 
     try:
         groups = select_groups(robot, args)
@@ -597,8 +658,11 @@ def main() -> int:
             return 0 if all(result["passed"] for result in results) else 1
         run_read_mode(robot, groups[0][0])
     except KeyboardInterrupt:
-        print("\nStopped by user.")
-        return 130
+        idle_requested = True
+        idle_errors = enter_idle(robot)
+        if idle_errors:
+            print("切换到 IDLE 时发生异常：" + "; ".join(idle_errors))
+        return wait_for_exit_interrupt()
     except MotionError as error:
         damping_errors = emergency_damping(robot, error.group)
         print_emergency_report(robot, error, damping_errors)
@@ -607,7 +671,7 @@ def main() -> int:
         print(f"\nABORTED: {error}")
         return 1
     finally:
-        if initialize_mode:
+        if initialize_mode and not idle_requested:
             emergency_damping(
                 robot,
                 [joint_id for group in groups for joint_id in group],
