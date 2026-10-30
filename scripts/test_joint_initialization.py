@@ -156,7 +156,12 @@ def motor_position(robot: Humanoid, joint_id: int, model_target: float) -> float
 
 def read_position(robot: Humanoid, joint_id: int) -> tuple[float, float]:
     bus, device_id, joint_name = robot.joints[joint_id]
-    raw_position = bus.read_position_measured(device_id, timeout=POSITION_TIMEOUT)
+    try:
+        raw_position = bus.read_position_measured(device_id, timeout=POSITION_TIMEOUT)
+    except Exception as error:
+        raise TestError(
+            f"读取 {joint_name} ({bus.channel}, ID {device_id}) 位置失败: {error}"
+        ) from error
     if raw_position is None or not math.isfinite(raw_position):
         raise TestError(
             f"no valid position feedback from {joint_name} "
@@ -337,12 +342,21 @@ def enter_idle(robot: Humanoid) -> list[str]:
 
 
 def wait_for_exit_interrupt() -> int:
-    print("所有电机已切换到 IDLE（不保持位置）。再次按 Ctrl+C 退出脚本。")
+    print("所有电机已切换到 IDLE（不保持位置），脚本即将退出。")
+    return 130
+
+
+def wait_for_damping_exit(robot: Humanoid) -> int:
+    print("初始化失败，电机保持 DAMPING。按 Ctrl+C 切换到 IDLE 并退出脚本。")
     try:
         while True:
             time.sleep(1.0)
     except KeyboardInterrupt:
-        print("\nExiting.")
+        idle_errors = enter_idle(robot)
+        if idle_errors:
+            print("切换到 IDLE 时发生异常：" + "; ".join(idle_errors))
+            return 1
+        print("\n所有电机已切换到 IDLE（不保持位置），脚本退出。")
         return 130
 
 
@@ -563,7 +577,8 @@ def print_emergency_report(
             print(f"最后指令：{command:+.3f} rad ({math.degrees(command):+.2f} deg)")
         if position is not None:
             print(f"最后有效位置：{position:+.3f} rad ({math.degrees(position):+.2f} deg)")
-            print(f"最后有效误差：{command - position:+.3f} rad")
+            if command is not None:
+                print(f"最后有效误差：{command - position:+.3f} rad")
         if velocity is not None:
             print(f"最后有效速度：{velocity:+.3f} rad/s")
 
@@ -602,7 +617,10 @@ def run_initialize_mode(
     args: argparse.Namespace,
 ) -> list[dict]:
     # This is the same gain/mode setup used by run_locomotion.py.
-    robot.enter_damping()
+    try:
+        robot.enter_damping()
+    except Exception as error:
+        raise TestError(f"电机进入 DAMPING 初始化配置失败: {error}") from error
     all_results = []
 
     for group_number, group in enumerate(groups, start=1):
@@ -666,9 +684,31 @@ def main() -> int:
     except MotionError as error:
         damping_errors = emergency_damping(robot, error.group)
         print_emergency_report(robot, error, damping_errors)
-        return 1
+        idle_requested = True
+        return wait_for_damping_exit(robot)
     except TestError as error:
         print(f"\nABORTED: {error}")
+        if initialize_mode:
+            damping_errors = emergency_damping(
+                robot,
+                [joint_id for group in groups for joint_id in group],
+            )
+            if damping_errors:
+                print("阻尼发送异常：" + "; ".join(damping_errors))
+            idle_requested = True
+            return wait_for_damping_exit(robot)
+        return 1
+    except Exception as error:
+        print(f"\n初始化过程中发生未处理异常: {error}")
+        if initialize_mode:
+            damping_errors = emergency_damping(
+                robot,
+                [joint_id for group in groups for joint_id in group],
+            )
+            if damping_errors:
+                print("阻尼发送异常：" + "; ".join(damping_errors))
+            idle_requested = True
+            return wait_for_damping_exit(robot)
         return 1
     finally:
         if initialize_mode and not idle_requested:

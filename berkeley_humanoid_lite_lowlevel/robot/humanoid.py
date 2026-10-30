@@ -141,17 +141,22 @@ class Humanoid:
             print(f"Initializing joint {joint_name}:")
             print(f"  kp: {self.joint_kp[i]}, kd: {self.joint_kd[i]}, torque limit: {self.torque_limit[i]}")
 
-            # Set the joint mode to idle
-            bus.set_mode(device_id, recoil.Mode.IDLE)
-            time.sleep(0.001)
-            bus.write_position_kp(device_id, self.joint_kp[i])
-            time.sleep(0.001)
-            bus.write_position_kd(device_id, self.joint_kd[i])
-            time.sleep(0.001)
-            bus.write_torque_limit(device_id, self.torque_limit[i])
-            time.sleep(0.001)
-            bus.feed(device_id)
-            bus.set_mode(device_id, recoil.Mode.DAMPING)
+            try:
+                # Set the joint mode to idle
+                bus.set_mode(device_id, recoil.Mode.IDLE)
+                time.sleep(0.001)
+                bus.write_position_kp(device_id, self.joint_kp[i])
+                time.sleep(0.001)
+                bus.write_position_kd(device_id, self.joint_kd[i])
+                time.sleep(0.001)
+                bus.write_torque_limit(device_id, self.torque_limit[i])
+                time.sleep(0.001)
+                bus.feed(device_id)
+                bus.set_mode(device_id, recoil.Mode.DAMPING)
+            except Exception as error:
+                raise RuntimeError(
+                    f"{bus.channel} ID {device_id} ({joint_name}): {error}"
+                ) from error
 
         print("Motors enabled")
 
