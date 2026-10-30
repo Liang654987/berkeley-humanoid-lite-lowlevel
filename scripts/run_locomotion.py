@@ -1,5 +1,11 @@
 # Copyright (c) 2025, The Berkeley Humanoid Lite Project Developers.
 
+import sys
+from pathlib import Path
+
+# Allow running this file directly from the repository checkout.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from cc.udp import UDP
 from loop_rate_limiters import RateLimiter
 

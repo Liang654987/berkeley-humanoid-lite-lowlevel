@@ -25,6 +25,7 @@ classifiers = [
 dependencies = [
     "cc.udp",
     "inputs",
+    "loop-rate-limiters",
     "numpy==1.26.1",
     "omegaconf",
     "onnxruntime",

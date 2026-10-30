@@ -43,6 +43,41 @@ class XInputEntry:
     BTN_START = "BTN_START"
 
 
+# Raw event names reported by the Xiaoji controller mapped to the standard
+# XInput names consumed by Se2Gamepad.
+XIAOJI_EVENT_REMAP = {
+    ##四个圆键
+    "BTN_EAST": "BTN_SOUTH",
+    "BTN_C": "BTN_EAST",
+    "BTN_SOUTH": "BTN_WEST",
+    "BTN_NORTH": "BTN_NORTH",
+    ##右摇杆
+    "ABS_RZ": "ABS_RY",
+    "ABS_Z": "ABS_RX",
+    "BTN_START": "BTN_THUMBR",
+    ##左摇杆
+    "ABS_Y": "ABS_Y",
+    "ABS_X": "ABS_X",
+    "BTN_SELECT": "BTN_THUMBL",
+    ##十字键
+    "ABS_HAT0X": "ABS_HAT0X",
+    "ABS_HAT0Y": "ABS_HAT0Y",
+    ##左肩键
+    "BTN_WEST": "BTN_TL",
+    "ABS_RX": "ABS_Z",
+    "BTN_TL": "BTN_TL2",
+    ##右肩键
+    "BTN_Z": "BTN_TR",
+    "ABS_RY": "ABS_RZ",
+    "BTN_TR": "BTN_TR2",
+    ##其他
+    "BTN_TL2": "BTN_SELECT",
+    "BTN_TR2": "BTN_START",
+    "BTN_THUMBL": "BTN_C",
+    "BTN_MODE": "BTN_MODE",
+}
+
+
 class Se2Gamepad:
     def __init__(self,
                  stick_sensitivity: float = 1.0,
@@ -53,6 +88,7 @@ class Se2Gamepad:
 
         self._stopped = threading.Event()
         self._run_forever_thread = None
+        self._last_mode_switch = 0
 
         self.reset()
 
@@ -65,6 +101,7 @@ class Se2Gamepad:
 
     def reset(self) -> None:
         self._states = {key: 0 for key in XInputEntry.__dict__.values()}
+        self._last_mode_switch = 0
 
     def stop(self) -> None:
         print("Gamepad stopping...")
@@ -87,7 +124,8 @@ class Se2Gamepad:
 
         # update all events from the joystick
         for event in events:
-            self._states[event.code] = event.state
+            mapped_code = XIAOJI_EVENT_REMAP.get(event.code, event.code)
+            self._states[mapped_code] = event.state
 
         self._update_command_buffer()
 
@@ -118,6 +156,15 @@ class Se2Gamepad:
             mode_switch = 1
 
         self.commands["mode_switch"] = mode_switch
+        if mode_switch != self._last_mode_switch:
+            mode_names = {
+                0: "no mode switch",
+                1: "idle mode",
+                2: "RL init mode",
+                3: "RL control mode",
+            }
+            print(f"Gamepad: entered {mode_names[mode_switch]}.")
+            self._last_mode_switch = mode_switch
 
 
 if __name__ == "__main__":
