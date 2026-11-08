@@ -361,6 +361,83 @@ def wait_for_damping_exit(robot: Humanoid) -> int:
         return 130
 
 
+def check_motion_feedback(
+    group: list[int],
+    commands: dict[int, float],
+    feedback: dict[int, tuple[float, float]],
+    previous_positions: dict[int, float],
+    step: int,
+    timeout_count: int,
+) -> None:
+    for joint_id in group:
+        position, velocity = feedback[joint_id]
+        position_step = abs(position - previous_positions[joint_id])
+        tracking_error = abs(commands[joint_id] - position)
+        if position_step > MAX_POSITION_STEP:
+            reason = f"位置单步跳变 {position_step:.3f} rad"
+        elif abs(velocity) > MAX_VELOCITY:
+            reason = f"速度过高 {velocity:.3f} rad/s"
+        elif tracking_error > MAX_TRACKING_ERROR:
+            reason = f"跟踪误差过大 {tracking_error:.3f} rad"
+        else:
+            previous_positions[joint_id] = position
+            continue
+        raise MotionError(
+            reason=reason,
+            group=group,
+            fault_joint_ids=[joint_id],
+            step=step,
+            commands=commands,
+            feedback=feedback,
+            timeout_count=timeout_count,
+        )
+
+
+def hold_group_at_target_position(
+    robot: Humanoid,
+    group: list[int],
+    results: list[dict],
+    frequency: float,
+) -> None:
+    commands = {result["joint_id"]: result["target"] for result in results}
+    feedback = {
+        result["joint_id"]: (result["final"], result["velocity"])
+        for result in results
+    }
+    previous_positions = {joint_id: feedback[joint_id][0] for joint_id in group}
+    timeout_count = max(result["timeouts"] for result in results)
+    period = 1.0 / frequency
+    print("\n本组初始化成功，保持目标位置。按 Ctrl+C 切换到 IDLE 并退出脚本。")
+
+    while True:
+        loop_start = time.perf_counter()
+        # Position mode is already active; keep the watchdog fed while holding.
+        for joint_id in group:
+            bus, device_id, _ = robot.joints[joint_id]
+            bus.feed(device_id)
+        try:
+            new_feedback, new_timeouts = exchange_group(robot, group, commands)
+        except CommunicationError as error:
+            raise MotionError(
+                reason=f"保持位置时连续{error.attempts}次未收到PDO反馈",
+                group=group,
+                fault_joint_ids=error.missing_joint_ids,
+                step=INIT_STEPS,
+                commands=commands,
+                feedback=feedback,
+                timeout_count=timeout_count + error.timeout_count,
+                communication_failure=True,
+            ) from error
+        feedback = new_feedback
+        timeout_count += new_timeouts
+        check_motion_feedback(
+            group, commands, feedback, previous_positions, INIT_STEPS, timeout_count,
+        )
+        elapsed = time.perf_counter() - loop_start
+        if elapsed < period:
+            time.sleep(period - elapsed)
+
+
 def run_group(
     robot: Humanoid,
     group: list[int],
@@ -441,41 +518,9 @@ def run_group(
             ) from error
         timeout_count += new_timeouts
 
-        for joint_id in group:
-            position, velocity = last_feedback[joint_id]
-            position_step = abs(position - previous_positions[joint_id])
-            tracking_error = abs(commands[joint_id] - position)
-            if position_step > MAX_POSITION_STEP:
-                raise MotionError(
-                    reason=f"位置单步跳变 {position_step:.3f} rad",
-                    group=group,
-                    fault_joint_ids=[joint_id],
-                    step=step,
-                    commands=commands,
-                    feedback=last_feedback,
-                    timeout_count=timeout_count,
-                )
-            if abs(velocity) > MAX_VELOCITY:
-                raise MotionError(
-                    reason=f"速度过高 {velocity:.3f} rad/s",
-                    group=group,
-                    fault_joint_ids=[joint_id],
-                    step=step,
-                    commands=commands,
-                    feedback=last_feedback,
-                    timeout_count=timeout_count,
-                )
-            if tracking_error > MAX_TRACKING_ERROR:
-                raise MotionError(
-                    reason=f"跟踪误差过大 {tracking_error:.3f} rad",
-                    group=group,
-                    fault_joint_ids=[joint_id],
-                    step=step,
-                    commands=commands,
-                    feedback=last_feedback,
-                    timeout_count=timeout_count,
-                )
-            previous_positions[joint_id] = position
+        check_motion_feedback(
+            group, commands, last_feedback, previous_positions, step, timeout_count,
+        )
 
         if step == 1 or step % 5 == 0 or step == INIT_STEPS:
             status = " | ".join(
@@ -653,9 +698,12 @@ def run_initialize_mode(
             if not all(result["passed"] for result in results):
                 print("Group failed; remaining groups will not be started.")
                 break
+            if group_number == len(groups):
+                # Earlier groups keep their existing damping behavior in --all.
+                hold_group_at_target_position(robot, group, results, args.frequency)
         except KeyboardInterrupt:
             interrupted = True
-            set_group_mode(robot, group, recoil.Mode.IDLE)
+            # main() switches every motor to IDLE before closing the CAN buses.
             raise
         finally:
             if not interrupted:
