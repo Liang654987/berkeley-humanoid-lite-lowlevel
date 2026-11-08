@@ -30,20 +30,21 @@ CALIBRATION_PATH = ROOT / "calibration.yaml"
 IDEAL_VALUES = np.deg2rad(np.array([
     -10.0, +33.75, +56.25,
     0.0,
-    -45.0, -15.0,
+    -45.0, -15.0,#右腿
     +10.0, -33.75, +56.25,
     0.0,
-    -45.0, +15.0,
+    -45.0, +15.0,#左腿
 ]))
 
 # True means that the positive extreme is the mechanical calibration limit.
+# True 意味着正极值是机械校准极限。
 TAKE_MAXIMUM = np.array([
     False, True, True,
     False,
-    False, False,
+    False, False,#右腿
     True, False, True,
     False,
-    False, True,
+    False, True,#左腿
 ])
 
 
