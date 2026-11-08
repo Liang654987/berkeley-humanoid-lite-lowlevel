@@ -7,6 +7,7 @@ Run this script after each power cycle to calibrate the encoder offset of each j
 """
 
 import argparse
+import math
 import os
 from pathlib import Path
 import select
@@ -28,23 +29,27 @@ from berkeley_humanoid_lite_lowlevel.robot.humanoid import Humanoid, JointConfig
 CALIBRATION_PATH = ROOT / "calibration.yaml"
 
 IDEAL_VALUES = np.deg2rad(np.array([
+    # 左腿，与 Humanoid.joints 的前 6 项一致。
     -10.0, +33.75, +56.25,
     0.0,
-    -45.0, -15.0,#右腿
+    -45.0, -15.0,
+    # 右腿，与 Humanoid.joints 的后 6 项一致。
     +10.0, -33.75, +56.25,
     0.0,
-    -45.0, +15.0,#左腿
+    -45.0, +15.0,
 ]))
 
 # True means that the positive extreme is the mechanical calibration limit.
 # True 意味着正极值是机械校准极限。
 TAKE_MAXIMUM = np.array([
+    # 左腿
     False, True, True,
     False,
-    False, False,#右腿
+    False, False,
+    # 右腿
     True, False, True,
     False,
-    False, True,#左腿
+    False, True,
 ])
 
 
@@ -124,6 +129,27 @@ def close_can_transports(robot: Humanoid) -> None:
         bus.stop()
 
 
+def print_joint_readings(
+    robot: Humanoid,
+    readings: np.ndarray,
+    starts: np.ndarray,
+    limits: np.ndarray,
+    redraw: bool = False,
+) -> None:
+    if redraw:
+        print(f"\033[{len(robot.joints) + 1}A", end="")
+    print(f"{'joint':35s} {'current(rad)':>12s} {'delta(deg)':>11s} {'limit(rad)':>11s} {'edge':>4s}")
+    for i, (bus, device_id, name) in enumerate(robot.joints):
+        label = f"{bus.channel}:{device_id} {name}"
+        edge = "max" if TAKE_MAXIMUM[i] else "min"
+        print(
+            f"{label:35s} {readings[i]:+12.5f} "
+            f"{math.degrees(readings[i] - starts[i]):+11.2f} "
+            f"{limits[i]:+11.5f} {edge:>4s}"
+        )
+    sys.stdout.flush()
+
+
 def calibrate(robot: Humanoid, timeout: float) -> np.ndarray:
     # A zero offset cannot correct the scale or sign of a wrong gear ratio.
     robot.check_gear_ratios(timeout=timeout)
@@ -133,25 +159,39 @@ def calibrate(robot: Humanoid, timeout: float) -> np.ndarray:
         )
 
     print("Reading initial joint positions...", flush=True)
-    limit_readings = read_joint_positions(robot, timeout)
-    print([f"{reading:.4f}" for reading in limit_readings])
+    starting_readings = read_joint_positions(robot, timeout)
+    joint_readings = starting_readings.copy()
+    limit_readings = starting_readings.copy()
     print(
         "Move every joint to its mechanical calibration limit. "
         "Press q or Enter to finish and save; Ctrl+C cancels without saving."
     )
+    print(
+        "实时位置尚未扣零位；delta(deg) 显示相对启动时的变化；"
+        "limit(rad) 仅记录指定方向的极值，回转时通常不变。"
+    )
+    interactive = sys.stdout.isatty()
+    display_period = 0.2 if interactive else 1.0
+    print_joint_readings(robot, joint_readings, starting_readings, limit_readings)
+    last_display = time.monotonic()
 
     with StopKeyMonitor() as keyboard:
         while not keyboard.requested():
             joint_readings = read_joint_positions(robot, timeout)
             limit_readings = update_limits(limit_readings, joint_readings)
-            print(
-                "\rLimits: "
-                + " ".join(f"{reading:+.4f}" for reading in limit_readings),
-                end="",
-                flush=True,
-            )
+            now = time.monotonic()
+            if now - last_display >= display_period:
+                print_joint_readings(
+                    robot, joint_readings, starting_readings, limit_readings,
+                    redraw=interactive,
+                )
+                last_display = now
             time.sleep(0.05)
 
+    print_joint_readings(
+        robot, joint_readings, starting_readings, limit_readings,
+        redraw=interactive,
+    )
     print()
     return limit_readings
 
