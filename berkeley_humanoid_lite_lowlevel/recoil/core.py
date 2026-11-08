@@ -393,8 +393,10 @@ class Bus:
     def write_fast_frame_frequency(self, device_id: int, value: int) -> None:
         self._write_parameter_u32(device_id, Parameter.FAST_FRAME_FREQUENCY, value)
 
-    def read_gear_ratio(self, device_id: int) -> float | None:
-        return self._read_parameter_f32(device_id, Parameter.POSITION_CONTROLLER_GEAR_RATIO)
+    def read_gear_ratio(self, device_id: int, timeout=None) -> float | None:
+        return self._read_parameter_f32(
+            device_id, Parameter.POSITION_CONTROLLER_GEAR_RATIO, timeout
+        )
 
     def write_gear_ratio(self, device_id: int, value: float):
         self._write_parameter_f32(device_id, Parameter.POSITION_CONTROLLER_GEAR_RATIO, value)
