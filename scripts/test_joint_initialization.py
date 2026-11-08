@@ -24,6 +24,8 @@ MAX_POSITION_STEP = 0.20
 MAX_TRACKING_ERROR = 0.15
 MAX_VELOCITY = 1.0
 FINAL_TOLERANCE = 0.05
+SETTLING_TIMEOUT = 2.0
+SETTLING_SAMPLES = 3
 CAN_TIMEOUT_LIMIT = 10
 
 SYMMETRIC_GROUPS = [
@@ -398,6 +400,7 @@ def hold_group_at_target_position(
     group: list[int],
     results: list[dict],
     frequency: float,
+    settling_timeout: float | None = None,
 ) -> None:
     commands = {result["joint_id"]: result["target"] for result in results}
     feedback = {
@@ -407,7 +410,13 @@ def hold_group_at_target_position(
     previous_positions = {joint_id: feedback[joint_id][0] for joint_id in group}
     timeout_count = max(result["timeouts"] for result in results)
     period = 1.0 / frequency
-    print("\n本组初始化成功，保持目标位置。按 Ctrl+C 切换到 IDLE 并退出脚本。")
+    stable_samples = {joint_id: 0 for joint_id in group}
+    deadline = None
+    if settling_timeout is None:
+        print("\n本组初始化成功，保持目标位置。按 Ctrl+C 切换到 IDLE 并退出脚本。")
+    else:
+        deadline = time.perf_counter() + settling_timeout
+        print(f"\n轨迹指令已发送完，等待实际到位（最多 {settling_timeout:.1f} 秒）。")
 
     while True:
         loop_start = time.perf_counter()
@@ -419,7 +428,7 @@ def hold_group_at_target_position(
             new_feedback, new_timeouts = exchange_group(robot, group, commands)
         except CommunicationError as error:
             raise MotionError(
-                reason=f"保持位置时连续{error.attempts}次未收到PDO反馈",
+                reason=f"目标位置控制时连续{error.attempts}次未收到PDO反馈",
                 group=group,
                 fault_joint_ids=error.missing_joint_ids,
                 step=INIT_STEPS,
@@ -433,6 +442,20 @@ def hold_group_at_target_position(
         check_motion_feedback(
             group, commands, feedback, previous_positions, INIT_STEPS, timeout_count,
         )
+        if deadline is not None:
+            for result in results:
+                joint_id = result["joint_id"]
+                position, velocity = feedback[joint_id]
+                error = commands[joint_id] - position
+                stable_samples[joint_id] = (
+                    stable_samples[joint_id] + 1 if abs(error) <= FINAL_TOLERANCE else 0
+                )
+                result.update(
+                    final=position, velocity=velocity, error=error, timeouts=timeout_count,
+                    passed=stable_samples[joint_id] >= SETTLING_SAMPLES,
+                )
+            if all(result["passed"] for result in results) or time.perf_counter() >= deadline:
+                return
         elapsed = time.perf_counter() - loop_start
         if elapsed < period:
             time.sleep(period - elapsed)
@@ -553,6 +576,11 @@ def run_group(
             "timeouts": timeout_count,
             "passed": abs(error) <= FINAL_TOLERANCE,
         })
+    # The last ramp feedback is sampled immediately after sending the final
+    # command. Judge arrival using fresh feedback while holding that target.
+    hold_group_at_target_position(
+        robot, group, results, frequency, settling_timeout=SETTLING_TIMEOUT,
+    )
     return results
 
 
@@ -696,8 +724,10 @@ def run_initialize_mode(
             all_results.extend(results)
             print_results(robot, results)
             if not all(result["passed"] for result in results):
-                print("Group failed; remaining groups will not be started.")
-                break
+                raise TestError(
+                    f"到位等待超时：未能连续 {SETTLING_SAMPLES} 次满足 "
+                    f"{FINAL_TOLERANCE:.3f} rad 的位置误差要求；后续组不再启动。"
+                )
             if group_number == len(groups):
                 # Earlier groups keep their existing damping behavior in --all.
                 hold_group_at_target_position(robot, group, results, args.frequency)
