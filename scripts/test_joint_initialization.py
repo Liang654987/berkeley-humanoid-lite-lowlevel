@@ -9,6 +9,7 @@ import numpy as np
 import berkeley_humanoid_lite_lowlevel.recoil as recoil
 from berkeley_humanoid_lite_lowlevel.robot.humanoid import (
     Humanoid,
+    JointConfigurationError,
     linear_interpolate,
 )
 
@@ -619,6 +620,8 @@ def run_initialize_mode(
     # This is the same gain/mode setup used by run_locomotion.py.
     try:
         robot.enter_damping()
+    except JointConfigurationError:
+        raise
     except Exception as error:
         raise TestError(f"电机进入 DAMPING 初始化配置失败: {error}") from error
     all_results = []
@@ -667,6 +670,7 @@ def main() -> int:
     groups = []
     initialize_mode = args.mode == "initialize"
     idle_requested = False
+    configuration_failed = False
 
     try:
         groups = select_groups(robot, args)
@@ -675,6 +679,10 @@ def main() -> int:
             print_results(robot, results)
             return 0 if all(result["passed"] for result in results) else 1
         run_read_mode(robot, groups[0][0])
+    except JointConfigurationError as error:
+        configuration_failed = True
+        print(f"\nABORTED: {error}")
+        return 1
     except KeyboardInterrupt:
         idle_requested = True
         idle_errors = enter_idle(robot)
@@ -711,7 +719,7 @@ def main() -> int:
             return wait_for_damping_exit(robot)
         return 1
     finally:
-        if initialize_mode and not idle_requested:
+        if initialize_mode and not idle_requested and not configuration_failed:
             emergency_damping(
                 robot,
                 [joint_id for group in groups for joint_id in group],

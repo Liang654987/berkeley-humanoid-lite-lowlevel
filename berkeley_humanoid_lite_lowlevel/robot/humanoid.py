@@ -1,5 +1,6 @@
 # Copyright (c) 2025, The Berkeley Humanoid Lite Project Developers.
 
+import math
 import time
 from pathlib import Path
 
@@ -24,7 +25,14 @@ def linear_interpolate(start: np.ndarray, end: np.ndarray, percentage: float) ->
     return target
 
 
+class JointConfigurationError(RuntimeError):
+    pass
+
+
 class Humanoid:
+    # The firmware divides motor-shaft angles by this signed gearbox ratio.
+    JOINT_GEAR_RATIO = -15.0
+
     def __init__(self, start_peripherals: bool = True):
 
         # self.left_arm_transport = recoil.Bus("can0")
@@ -126,7 +134,25 @@ class Humanoid:
         else:
             print(f"Warning: {config_path} not found; using zero joint offsets.")
 
+    def check_gear_ratios(self, timeout: float = 0.1) -> None:
+        errors = []
+        for bus, device_id, joint_name in self.joints:
+            ratio = bus.read_gear_ratio(device_id, timeout=timeout)
+            if ratio is None or not math.isclose(ratio, self.JOINT_GEAR_RATIO, rel_tol=1e-6):
+                errors.append(
+                    f"{joint_name} ({bus.channel}, ID {device_id}): "
+                    f"gear_ratio={ratio}, expected {self.JOINT_GEAR_RATIO}"
+                )
+        if errors:
+            raise JointConfigurationError(
+                "Invalid actuator gear ratios:\n" + "\n".join(errors)
+                + "\nCheck with: python3 scripts/motor/configure_parameter.py --all"
+                + "\nCorrect the actuator parameters, then recalibrate joints before enabling motion."
+            )
+
     def enter_damping(self):
+        # Check all actuators before writing any gains or enabling any motor.
+        self.check_gear_ratios()
         self.joint_kp = np.zeros((len(self.joints),), dtype=np.float32)
         self.joint_kd = np.zeros((len(self.joints),), dtype=np.float32)
         self.torque_limit = np.zeros((len(self.joints),), dtype=np.float32)

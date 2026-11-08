@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from berkeley_humanoid_lite_lowlevel.robot import Humanoid
+from berkeley_humanoid_lite_lowlevel.robot.humanoid import Humanoid, JointConfigurationError
 
 
 CALIBRATION_PATH = ROOT / "calibration.yaml"
@@ -125,6 +125,8 @@ def close_can_transports(robot: Humanoid) -> None:
 
 
 def calibrate(robot: Humanoid, timeout: float) -> np.ndarray:
+    # A zero offset cannot correct the scale or sign of a wrong gear ratio.
+    robot.check_gear_ratios(timeout=timeout)
     if len(robot.joints) != len(IDEAL_VALUES):
         raise ValueError(
             f"expected {len(IDEAL_VALUES)} joints, found {len(robot.joints)}"
@@ -193,6 +195,9 @@ def main() -> int:
             yaml.safe_dump(calibration_data, calibration_file)
         print(f"Calibration saved to {CALIBRATION_PATH}")
         return 0
+    except JointConfigurationError as error:
+        print(f"\nERROR: {error}\nNo calibration file was changed.", file=sys.stderr)
+        return 1
     except JointReadError as error:
         print(f"\nERROR: {error}", file=sys.stderr)
         print(
