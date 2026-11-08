@@ -32,6 +32,16 @@ class JointConfigurationError(RuntimeError):
 class Humanoid:
     # The firmware divides motor-shaft angles by this signed gearbox ratio.
     JOINT_GEAR_RATIO = -15.0
+    INIT_DURATION = 4.0
+    INIT_SETTLING_TIMEOUT = 2.0
+    INIT_FINAL_TOLERANCE = 0.05
+    INIT_STABLE_SAMPLES = 3
+    INIT_MAX_TRAVEL = 0.5
+    INIT_MAX_SAMPLE_SPREAD = 0.03
+    INIT_MAX_POSITION_STEP = 0.20
+    INIT_MAX_VELOCITY = 1.0
+    INIT_MAX_TRACKING_ERROR = 0.15
+    INIT_CAN_TIMEOUT_LIMIT = 10
 
     def __init__(self, start_peripherals: bool = True):
 
@@ -73,13 +83,6 @@ class Humanoid:
 
         self.imu = None
         self.command_controller = None
-        if start_peripherals:
-            self.imu = SerialImu(baudrate=Baudrate.BAUD_460800)
-            self.imu.run_forever()
-
-            # Start joystick thread
-            self.command_controller = Se2Gamepad()
-            self.command_controller.run()
 
         self.state = State.IDLE
         self.next_state = State.IDLE
@@ -122,17 +125,41 @@ class Humanoid:
         # used for RL initialization controller
         self.init_percentage = 0.0
         self.starting_positions = np.zeros_like(self.joint_position_target, dtype=np.float32)
+        self.init_ready = False
+        self.init_failed = False
+        self._init_started_at = 0.0
+        self._init_settling_at = None
+        self._init_stable_samples = 0
+        self._init_timeouts = np.zeros(len(self.joints), dtype=int)
+        self._init_previous_positions = self.starting_positions.copy()
 
+        self._calibration_loaded = False
         config_path = Path(__file__).resolve().parents[2] / "calibration.yaml"
         if config_path.exists():
             with open(config_path, "r") as f:
                 config = OmegaConf.load(f)
-            position_offsets = np.array(config.get("position_offsets", None))
-            if position_offsets is None or position_offsets.shape[0] != len(self.joints):
-                raise ValueError(f"Invalid calibration data in {config_path}: expected {len(self.joints)} offsets, got {None if position_offsets is None else position_offsets.shape[0]}")
+            position_offsets = np.array(config.get("position_offsets", None), dtype=np.float32)
+            if position_offsets.shape != (len(self.joints),) or not np.all(np.isfinite(position_offsets)):
+                raise ValueError(f"Invalid calibration data in {config_path}: expected {len(self.joints)} finite offsets")
             self.position_offsets[:] = position_offsets
+            self._calibration_loaded = True
         else:
             print(f"Warning: {config_path} not found; using zero joint offsets.")
+
+        # Parse calibration before starting background threads.
+        if start_peripherals:
+            self.imu = SerialImu(baudrate=Baudrate.BAUD_460800)
+            self.imu.run_forever()
+            self.command_controller = Se2Gamepad()
+            self.command_controller.run()
+
+    def check_initialization_configuration(self) -> None:
+        # Calibration tools may construct Humanoid without a saved calibration;
+        # locomotion must not enable motion with the fallback zero offsets.
+        if not self._calibration_loaded or not np.all(np.isfinite(self.position_offsets)):
+            raise JointConfigurationError(
+                "Valid calibration.yaml is required; run scripts/calibrate_joints.py first."
+            )
 
     def check_gear_ratios(self, timeout: float = 0.1) -> None:
         errors = []
@@ -246,30 +273,45 @@ class Humanoid:
         self.joints[joint_id_l][0].transmit_pdo_2(self.joints[joint_id_l][1], position_target=position_target_l, velocity_target=0.0)
         self.joints[joint_id_r][0].transmit_pdo_2(self.joints[joint_id_r][1], position_target=position_target_r, velocity_target=0.0)
 
-        position_measured_l, velocity_measured_l = self.joints[joint_id_l][0].receive_pdo_2(self.joints[joint_id_l][1])
-        position_measured_r, velocity_measured_r = self.joints[joint_id_r][0].receive_pdo_2(self.joints[joint_id_r][1])
+        received = []
+        for joint_id in (joint_id_l, joint_id_r):
+            bus, device_id, _ = self.joints[joint_id]
+            if self.state == State.RL_INIT:
+                # Do not mistake a late parameter reply for position feedback.
+                frame = bus.receive(
+                    filter_device_id=device_id,
+                    filter_function=recoil.Function.TRANSMIT_PDO_2,
+                    timeout=0.001,
+                )
+                if frame is None:
+                    received.append(False)
+                    continue
+                feedback = bus.unpack("<ff", frame.data)
+                if len(feedback) != 2 or not all(math.isfinite(value) for value in feedback):
+                    raise RuntimeError(f"{self._joint_label(joint_id)}: invalid PDO feedback")
+                position, velocity = feedback
+            else:
+                position, velocity = bus.receive_pdo_2(device_id)
 
-        # adjust direction and offset of target values
-        if position_measured_l is not None:
-            self.joint_position_measured[joint_id_l] = (position_measured_l * self.joint_axis_directions[joint_id_l]) - self.position_offsets[joint_id_l]
-        if velocity_measured_l is not None:
-            self.joint_velocity_measured[joint_id_l] = velocity_measured_l * self.joint_axis_directions[joint_id_l]
-        if position_measured_r is not None:
-            self.joint_position_measured[joint_id_r] = (position_measured_r * self.joint_axis_directions[joint_id_r]) - self.position_offsets[joint_id_r]
-        if velocity_measured_r is not None:
-            self.joint_velocity_measured[joint_id_r] = velocity_measured_r * self.joint_axis_directions[joint_id_r]
+            received.append(position is not None and velocity is not None)
+            # adjust direction and offset of measured values
+            if position is not None:
+                self.joint_position_measured[joint_id] = position * self.joint_axis_directions[joint_id] - self.position_offsets[joint_id]
+            if velocity is not None:
+                self.joint_velocity_measured[joint_id] = velocity * self.joint_axis_directions[joint_id]
+        return received
 
     def update_joints(self):
+        # PDO traffic alone does not feed the firmware watchdog.
+        if self.state in (State.RL_INIT, State.RL_RUNNING):
+            for bus, device_id, _ in self.joints:
+                bus.feed(device_id)
+        received = np.zeros(len(self.joints), dtype=bool)
+        for left in range(6):
+            received[left], received[left + 6] = self.update_joint_group(left, left + 6)
+        return received
 
-        # communicate with actuators
-        self.update_joint_group(0, 6)
-        self.update_joint_group(1, 7)
-        self.update_joint_group(2, 8)
-        self.update_joint_group(3, 9)
-        self.update_joint_group(4, 10)
-        self.update_joint_group(5, 11)
-
-    def reset(self):
+    def _read_joint_positions(self):
         initial_positions = np.empty(len(self.joints), dtype=np.float32)
         missing_joints = []
 
@@ -296,7 +338,10 @@ class Humanoid:
                 "Cannot initialize: no valid position feedback from "
                 + ", ".join(missing_joints)
             )
+        return initial_positions
 
+    def reset(self):
+        initial_positions = self._read_joint_positions()
         self.joint_position_measured[:] = initial_positions
         self.joint_velocity_measured.fill(0.0)
         self.joint_position_target[:] = initial_positions
@@ -309,6 +354,118 @@ class Humanoid:
         obs = self.get_observations()
         return obs
 
+    def _joint_label(self, joint_id):
+        bus, device_id, name = self.joints[joint_id]
+        return f"{name} ({bus.channel}, ID {device_id})"
+
+    def _start_initialization(self):
+        self.init_ready = False
+        self.init_failed = False
+        self.init_percentage = 0.0
+        self._init_settling_at = None
+        self._init_stable_samples = 0
+        self._init_timeouts.fill(0)
+        self.check_initialization_configuration()
+        self.check_gear_ratios()
+
+        samples = []
+        for _ in range(self.INIT_STABLE_SAMPLES):
+            samples.append(self._read_joint_positions())
+            time.sleep(0.02)
+        for joint_id, spread in enumerate(np.ptp(samples, axis=0)):
+            if spread > self.INIT_MAX_SAMPLE_SPREAD:
+                raise RuntimeError(f"{self._joint_label(joint_id)}: unstable start position, spread={spread:.3f} rad")
+
+        self.starting_positions = samples[-1].copy()
+        travel = self.rl_init_positions - self.starting_positions
+        print("Joint initialization plan:                  current     target     travel (rad)")
+        for joint_id in range(len(self.joints)):
+            print(f"{self._joint_label(joint_id):42s} {self.starting_positions[joint_id]:+9.3f} "
+                  f"{self.rl_init_positions[joint_id]:+10.3f} {travel[joint_id]:+10.3f}")
+        for joint_id in np.flatnonzero(np.abs(travel) > self.INIT_MAX_TRAVEL):
+            raise RuntimeError(f"{self._joint_label(joint_id)}: travel={abs(travel[joint_id]):.3f} rad "
+                               f"exceeds {self.INIT_MAX_TRAVEL:.3f} rad")
+
+        self.joint_position_target[:] = self.starting_positions
+        self.joint_position_measured[:] = self.starting_positions
+        self.joint_velocity_measured.fill(0.0)
+        # Preload all targets while still in DAMPING, before any POSITION command.
+        received = self.update_joints()
+        for joint_id in range(len(self.joints)):
+            if not received[joint_id]:
+                raise RuntimeError(f"{self._joint_label(joint_id)}: no PDO feedback while preloading targets")
+            if (abs(self.joint_position_measured[joint_id] - self.starting_positions[joint_id]) > self.INIT_MAX_SAMPLE_SPREAD
+                    or abs(self.joint_velocity_measured[joint_id]) > self.INIT_MAX_VELOCITY):
+                raise RuntimeError(f"{self._joint_label(joint_id)}: joint moved during preflight")
+        self._init_previous_positions = self.joint_position_measured.copy()
+        # Honor a cancel pressed while the preflight reads were in progress.
+        if self.command_controller.commands["mode_switch"] == State.IDLE:
+            self.state = State.IDLE
+            print("Initialization cancelled before entering position mode.")
+            return
+        for bus, device_id, _ in self.joints:
+            bus.feed(device_id)
+            bus.set_mode(device_id, recoil.Mode.POSITION)
+        self._init_started_at = time.monotonic()
+        print(f"Initializing over {self.INIT_DURATION:.1f} s; then checking arrival for up to {self.INIT_SETTLING_TIMEOUT:.1f} s.")
+
+    def _fail_initialization(self, reason):
+        self.state = State.RL_INIT
+        self.init_failed = True
+        self.init_ready = False
+        print(f"Initialization FAILED: {reason}")
+        # One failed CAN send must not prevent attempts to stop the other joints.
+        for bus, device_id, _ in self.joints:
+            try:
+                bus.set_mode(device_id, recoil.Mode.DAMPING)
+            except Exception as error:
+                print(f"DAMPING send failed for {bus.channel} ID {device_id}: {error}")
+        print("DAMPING requested for all joints. RL running is blocked; select idle before retrying initialization.")
+
+    def _check_initialization_feedback(self, received):
+        self._init_timeouts[received] = 0
+        self._init_timeouts[~received] += 1
+        errors = self.joint_position_target - self.joint_position_measured
+        for joint_id in range(len(self.joints)):
+            label = self._joint_label(joint_id)
+            if self._init_timeouts[joint_id] >= self.INIT_CAN_TIMEOUT_LIMIT:
+                raise RuntimeError(f"{label}: {self.INIT_CAN_TIMEOUT_LIMIT} consecutive missing PDO replies")
+            if not received[joint_id]:
+                continue
+            jump = abs(self.joint_position_measured[joint_id] - self._init_previous_positions[joint_id])
+            velocity = self.joint_velocity_measured[joint_id]
+            if jump > self.INIT_MAX_POSITION_STEP:
+                raise RuntimeError(f"{label}: position jump={jump:.3f} rad")
+            if abs(velocity) > self.INIT_MAX_VELOCITY:
+                raise RuntimeError(f"{label}: velocity={velocity:.3f} rad/s")
+            if abs(errors[joint_id]) > self.INIT_MAX_TRACKING_ERROR:
+                raise RuntimeError(f"{label}: tracking error={errors[joint_id]:+.3f} rad")
+            self._init_previous_positions[joint_id] = self.joint_position_measured[joint_id]
+
+        if self.init_percentage < 1.0:
+            return
+        now = time.monotonic()
+        if self._init_settling_at is None:
+            self._init_settling_at = now
+        # Retained values from a missing reply must never count as arrival.
+        at_target = received.all() and np.all(np.abs(errors) <= self.INIT_FINAL_TOLERANCE)
+        self._init_stable_samples = self._init_stable_samples + 1 if at_target else 0
+        if (self._init_stable_samples >= self.INIT_STABLE_SAMPLES
+                and (self.init_ready or now - self._init_settling_at <= self.INIT_SETTLING_TIMEOUT)):
+            if not self.init_ready:
+                print(f"Initialization PASSED: max error={np.max(np.abs(errors)):.3f} rad. "
+                      "Holding target positions; use the RL running command when ready.")
+            self.init_ready = True
+        elif not self.init_ready and now - self._init_settling_at >= self.INIT_SETTLING_TIMEOUT:
+            details = "; ".join(
+                f"{self._joint_label(joint_id)}: error={errors[joint_id]:+.3f} rad"
+                + (" (no PDO reply)" if not received[joint_id] else "")
+                for joint_id in range(len(self.joints))
+                if not received[joint_id] or abs(errors[joint_id]) > self.INIT_FINAL_TOLERANCE
+            )
+            raise RuntimeError(f"Arrival timeout: need {self.INIT_STABLE_SAMPLES} consecutive frames "
+                               f"within {self.INIT_FINAL_TOLERANCE:.3f} rad. {details}")
+
     def step(self, actions: np.ndarray):
         """
         actions: np.ndarray of shape (n_joints, )
@@ -320,46 +477,30 @@ class Humanoid:
                 if self.next_state == State.RL_INIT:
                     print("Switching to RL initialization mode")
                     self.state = self.next_state
-
-                    for entry in self.joints:
-                        bus, device_id, _ = entry
-                        bus.feed(device_id)
-                        bus.set_mode(device_id, recoil.Mode.POSITION)
-
-                    self.starting_positions = self.joint_position_target[:]
-                    self.init_percentage = 0.0
+                    try:
+                        self._start_initialization()
+                    except Exception as error:
+                        self._fail_initialization(error)
 
             case State.RL_INIT:
                 if self.next_state == State.IDLE:
                     print("Switching to idle mode")
                     self.state = State.IDLE
+                    self.init_ready = False
+                    self.init_failed = False
 
-                    for entry in self.joints:
-                        bus, device_id, _ = entry
-                        bus.set_mode(device_id, recoil.Mode.DAMPING)
-
-                    self.joint_position_target[:] = self.joint_position_measured[:]
-                    self.update_joints()
+                    try:
+                        for bus, device_id, _ in self.joints:
+                            bus.set_mode(device_id, recoil.Mode.DAMPING)
+                        self.joint_position_target[:] = self.joint_position_measured[:]
+                        self.update_joints()
+                    except Exception as error:
+                        self._fail_initialization(error)
                     return self.get_observations()
 
-                print(f"init: {self.init_percentage:.2f}")
-                if self.init_percentage < 1.0:
-                    self.init_percentage += 1 / 100.0
-                    self.init_percentage = min(self.init_percentage, 1.0)
-
-                    self.joint_position_target = linear_interpolate(self.starting_positions, self.rl_init_positions, self.init_percentage)
-                else:
-                    if self.next_state == State.RL_RUNNING:
-                        print("Switching to RL running mode")
-                        self.state = self.next_state
-
-                    if self.next_state == State.IDLE:
-                        print("Switching to idle mode")
-                        self.state = self.next_state
-
-                        for entry in self.joints:
-                            bus, device_id, _ = entry
-                            bus.set_mode(device_id, recoil.Mode.DAMPING)
+                if not self.init_failed:
+                    self.init_percentage = min((time.monotonic() - self._init_started_at) / self.INIT_DURATION, 1.0)
+                    self.joint_position_target[:] = linear_interpolate(self.starting_positions, self.rl_init_positions, self.init_percentage)
 
             case State.RL_RUNNING:
                 for i in range(len(self.joints)):
@@ -373,7 +514,19 @@ class Humanoid:
                         bus, device_id, _ = entry
                         bus.set_mode(device_id, recoil.Mode.DAMPING)
 
-        self.update_joints()
+        if self.state == State.RL_INIT:
+            if not self.init_failed:
+                try:
+                    received = self.update_joints()
+                    self._check_initialization_feedback(received)
+                    if (self.init_ready and self._init_stable_samples >= self.INIT_STABLE_SAMPLES
+                            and self.command_controller.commands["mode_switch"] == State.RL_RUNNING):
+                        print("Switching to RL running mode")
+                        self.state = State.RL_RUNNING
+                except Exception as error:
+                    self._fail_initialization(error)
+        else:
+            self.update_joints()
 
         obs = self.get_observations()
 
