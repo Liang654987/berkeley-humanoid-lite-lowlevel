@@ -9,13 +9,13 @@ import numpy as np
 import berkeley_humanoid_lite_lowlevel.recoil as recoil
 from berkeley_humanoid_lite_lowlevel.robot.humanoid import (
     Humanoid,
+    InitializationRamp,
     JointConfigurationError,
-    linear_interpolate,
+    receive_initialization_feedback,
 )
 
 
-INIT_STEPS = 100
-DEFAULT_FREQUENCY = 25.0  # 100 initialization steps take about 4 seconds.
+DEFAULT_FREQUENCY = 25.0
 POSITION_TIMEOUT = 0.1
 CAN_RETRY_DELAY = 0.02
 STABLE_SAMPLES = 3
@@ -24,6 +24,8 @@ MAX_POSITION_STEP = 0.20
 MAX_TRACKING_ERROR = 0.15
 MAX_VELOCITY = 1.0
 FINAL_TOLERANCE = 0.05
+SETTLING_VELOCITY = Humanoid.INIT_SETTLING_VELOCITY
+STABLE_TIME = Humanoid.INIT_STABLE_TIME
 SETTLING_TIMEOUT = 2.0
 SETTLING_SAMPLES = 3
 CAN_TIMEOUT_LIMIT = 10
@@ -90,7 +92,7 @@ def parse_args() -> argparse.Namespace:
         "--frequency",
         type=float,
         default=DEFAULT_FREQUENCY,
-        help="initialization update frequency in Hz (default: 25; about 4 seconds)",
+        help="initialization update frequency in Hz (default: 25)",
     )
     parser.add_argument(
         "--max-travel",
@@ -109,10 +111,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("use --all, or provide both -c/--channel and -i/--id")
     if args.mode == "initialize" and not args.enable:
         parser.error("initialize mode requires --enable")
-    if args.frequency <= 0:
-        parser.error("--frequency must be greater than zero")
-    if args.max_travel <= 0:
-        parser.error("--max-travel must be greater than zero")
+    if not math.isfinite(args.frequency) or args.frequency <= 0:
+        parser.error("--frequency must be finite and greater than zero")
+    if not math.isfinite(args.max_travel) or args.max_travel <= 0:
+        parser.error("--max-travel must be finite and greater than zero")
     return args
 
 
@@ -255,13 +257,8 @@ def exchange_group(
         missing = []
         for joint_id in group:
             bus, device_id, _ = robot.joints[joint_id]
-            raw_position, raw_velocity = bus.receive_pdo_2(device_id)
-            if (
-                raw_position is None
-                or raw_velocity is None
-                or not math.isfinite(raw_position)
-                or not math.isfinite(raw_velocity)
-            ):
+            raw_position, raw_velocity = receive_initialization_feedback(bus, device_id)
+            if raw_position is None:
                 missing.append(joint_id)
                 continue
             feedback[joint_id] = (
@@ -286,39 +283,6 @@ def exchange_group(
         if blocked:
             raise CommunicationError(blocked, CAN_TIMEOUT_LIMIT, timeout_count)
         time.sleep(CAN_RETRY_DELAY)
-
-
-def set_group_mode(robot: Humanoid, group: list[int], mode: int) -> None:
-    for joint_id in group:
-        bus, device_id, _ = robot.joints[joint_id]
-        bus.feed(device_id)
-        bus.set_mode(device_id, mode)
-
-
-def hold_group_at_current_position(
-    robot: Humanoid,
-    group: list[int],
-    starts: dict[int, tuple[float, float]],
-) -> dict[int, tuple[float, float]]:
-    commands = {joint_id: starts[joint_id][1] for joint_id in group}
-    try:
-        feedback, timeout_count = exchange_group(robot, group, commands)
-    except CommunicationError as error:
-        raise MotionError(
-            reason=f"连续{error.attempts}次未收到PDO反馈",
-            group=group,
-            fault_joint_ids=error.missing_joint_ids,
-            step=0,
-            commands=commands,
-            feedback=starts,
-            timeout_count=error.timeout_count,
-            communication_failure=True,
-        ) from error
-
-    set_group_mode(robot, group, recoil.Mode.POSITION)
-    if timeout_count:
-        print(f"预加载当前位置时发生 {timeout_count} 次超时重试")
-    return feedback
 
 
 def emergency_damping(robot: Humanoid, joint_ids: list[int]) -> list[str]:
@@ -411,6 +375,7 @@ def hold_group_at_target_position(
     timeout_count = max(result["timeouts"] for result in results)
     period = 1.0 / frequency
     stable_samples = {joint_id: 0 for joint_id in group}
+    stable_since = {joint_id: None for joint_id in group}
     deadline = None
     if settling_timeout is None:
         print("\n本组初始化成功，保持目标位置。按 Ctrl+C 切换到 IDLE 并退出脚本。")
@@ -431,7 +396,7 @@ def hold_group_at_target_position(
                 reason=f"目标位置控制时连续{error.attempts}次未收到PDO反馈",
                 group=group,
                 fault_joint_ids=error.missing_joint_ids,
-                step=INIT_STEPS,
+                step=100,
                 commands=commands,
                 feedback=feedback,
                 timeout_count=timeout_count + error.timeout_count,
@@ -440,21 +405,34 @@ def hold_group_at_target_position(
         feedback = new_feedback
         timeout_count += new_timeouts
         check_motion_feedback(
-            group, commands, feedback, previous_positions, INIT_STEPS, timeout_count,
+            group, commands, feedback, previous_positions, 100, timeout_count,
+        )
+        robot.log_initialization_feedback(
+            group, commands, previous_positions,
+            {joint_id: feedback[joint_id][1] for joint_id in group},
         )
         if deadline is not None:
+            now = time.perf_counter()
             for result in results:
                 joint_id = result["joint_id"]
                 position, velocity = feedback[joint_id]
                 error = commands[joint_id] - position
-                stable_samples[joint_id] = (
-                    stable_samples[joint_id] + 1 if abs(error) <= FINAL_TOLERANCE else 0
-                )
+                if new_timeouts:
+                    stable_samples[joint_id] = 0
+                    stable_since[joint_id] = None
+                if abs(error) <= FINAL_TOLERANCE and abs(velocity) <= SETTLING_VELOCITY:
+                    stable_samples[joint_id] += 1
+                    if stable_since[joint_id] is None:
+                        stable_since[joint_id] = now
+                else:
+                    stable_samples[joint_id] = 0
+                    stable_since[joint_id] = None
                 result.update(
                     final=position, velocity=velocity, error=error, timeouts=timeout_count,
-                    passed=stable_samples[joint_id] >= SETTLING_SAMPLES,
+                    passed=stable_samples[joint_id] >= SETTLING_SAMPLES
+                    and now - stable_since[joint_id] >= STABLE_TIME and now <= deadline,
                 )
-            if all(result["passed"] for result in results) or time.perf_counter() >= deadline:
+            if all(result["passed"] for result in results) or now >= deadline:
                 return
         elapsed = time.perf_counter() - loop_start
         if elapsed < period:
@@ -499,21 +477,39 @@ def run_group(
             communication_failure=True,
         ) from error
 
-    set_group_mode(robot, group, recoil.Mode.POSITION)
+    for joint_id in group:
+        position, velocity = feedback[joint_id]
+        if (abs(position - start_commands[joint_id]) > MAX_SAMPLE_SPREAD
+                or abs(velocity) > SETTLING_VELOCITY):
+            raise TestError(f"{joint_label(robot, joint_id)}: 预加载期间关节移动，已取消初始化")
+    robot.enter_initialization_position_mode(group)
+    ramp = InitializationRamp(
+        start_vector, target_vector, [joint_label(robot, joint_id) for joint_id in group],
+        FINAL_TOLERANCE, time.perf_counter(),
+    )
 
     previous_positions = {
         joint_id: feedback[joint_id][0]
         for joint_id in group
     }
+    commands = start_commands
     last_feedback = feedback
 
-    for step in range(1, INIT_STEPS + 1):
+    while True:
         loop_start = time.perf_counter()
-        command_vector = linear_interpolate(
-            start_vector,
-            target_vector,
-            step / INIT_STEPS,
-        )
+        try:
+            ramp.advance(
+                np.array([last_feedback[joint_id][0] for joint_id in group]),
+                True, loop_start,
+            )
+        except RuntimeError as error:
+            raise MotionError(
+                reason=str(error), group=group, fault_joint_ids=group,
+                step=int(ramp.progress * 100), commands=commands,
+                feedback=last_feedback, timeout_count=timeout_count,
+            ) from error
+        step = int(ramp.progress * 100)
+        command_vector = ramp.command
         commands = {
             joint_id: float(command_vector[index])
             for index, joint_id in enumerate(group)
@@ -545,16 +541,12 @@ def run_group(
             group, commands, last_feedback, previous_positions, step, timeout_count,
         )
 
-        if step == 1 or step % 5 == 0 or step == INIT_STEPS:
-            status = " | ".join(
-                f"{robot.joints[joint_id][0].channel}:{robot.joints[joint_id][1]} "
-                f"cmd={commands[joint_id]:+.3f} "
-                f"pos={last_feedback[joint_id][0]:+.3f} "
-                f"err={commands[joint_id] - last_feedback[joint_id][0]:+.3f} "
-                f"vel={last_feedback[joint_id][1]:+.3f}"
-                for joint_id in group
-            )
-            print(f"\r{step:3d}% | {status}", end="", flush=True)
+        robot.log_initialization_feedback(
+            group, commands, previous_positions,
+            {joint_id: last_feedback[joint_id][1] for joint_id in group},
+        )
+        if ramp.progress >= 1.0:
+            break
 
         elapsed = time.perf_counter() - loop_start
         if elapsed < period:
@@ -574,7 +566,7 @@ def run_group(
             "error": error,
             "velocity": final_velocity,
             "timeouts": timeout_count,
-            "passed": abs(error) <= FINAL_TOLERANCE,
+            "passed": False,
         })
     # The last ramp feedback is sampled immediately after sending the final
     # command. Judge arrival using fresh feedback while holding that target.
@@ -640,7 +632,7 @@ def print_emergency_report(
 ) -> None:
     print("\n========== EMERGENCY STOP ==========")
     print(f"原因：{error.reason}")
-    print(f"初始化步骤：{error.step}/{INIT_STEPS}")
+    print(f"初始化轨迹进度：{error.step}%")
     print(f"累计丢帧计数：{error.timeout_count}")
 
     for joint_id in error.fault_joint_ids:
@@ -700,19 +692,21 @@ def run_initialize_mode(
     all_results = []
 
     for group_number, group in enumerate(groups, start=1):
-        # Damping mode lets a joint move while its current position is sampled.
-        # Preload that position and hold it before checking feedback stability.
-        starts = {
+        # Keep the joints in DAMPING while waiting for operator input.
+        preview = {
             joint_id: read_position(robot, joint_id)
             for joint_id in group
         }
-        hold_group_at_current_position(robot, group, starts)
-        starts = read_stable_group(robot, group)
         print(f"\nGroup {group_number}/{len(groups)}")
-        print_group_plan(robot, group, starts, args.max_travel)
+        print_group_plan(robot, group, preview, args.max_travel)
         if not confirm_motion():
             break
 
+        starts = read_stable_group(robot, group)
+        for joint_id in group:
+            if abs(starts[joint_id][1] - preview[joint_id][1]) > MAX_SAMPLE_SPREAD:
+                raise TestError(f"{joint_label(robot, joint_id)}: 等待 MOVE 期间起点已变化，请重新确认")
+        print_group_plan(robot, group, starts, args.max_travel)
         interrupted = False
         try:
             results = run_group(
@@ -726,7 +720,8 @@ def run_initialize_mode(
             if not all(result["passed"] for result in results):
                 raise TestError(
                     f"到位等待超时：未能连续 {SETTLING_SAMPLES} 次满足 "
-                    f"{FINAL_TOLERANCE:.3f} rad 的位置误差要求；后续组不再启动。"
+                    f"{FINAL_TOLERANCE:.3f} rad 位置误差、{SETTLING_VELOCITY:.3f} rad/s 速度"
+                    f"并保持 {STABLE_TIME:.1f} 秒；后续组不再启动。"
                 )
             if group_number == len(groups):
                 # Earlier groups keep their existing damping behavior in --all.

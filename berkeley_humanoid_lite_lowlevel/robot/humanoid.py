@@ -29,13 +29,120 @@ class JointConfigurationError(RuntimeError):
     pass
 
 
+def receive_initialization_feedback(bus, device_id):
+    frame = bus.receive(
+        filter_device_id=device_id,
+        filter_function=recoil.Function.TRANSMIT_PDO_2,
+        timeout=0.001,
+    )
+    if frame is None:
+        return None, None
+    feedback = bus.unpack("<ff", frame.data)
+    if len(feedback) != 2 or not all(math.isfinite(value) for value in feedback):
+        raise RuntimeError(f"{bus.channel} ID {device_id}: invalid position/velocity feedback")
+    return feedback
+
+
+class InitializationRamp:
+    MAX_SPEED = 0.10
+    MAX_ACCELERATION = 0.20
+    MAX_TIMESTEP = 0.05
+    PAUSE_ERROR = 0.08
+    RESUME_ERROR = 0.06
+    PROGRESS_WINDOW = 0.5
+    STALL_TIMEOUT = 2.0
+    TIMEOUT = 30.0
+
+    def __init__(self, start, target, labels, progress_error, now):
+        self.start = start
+        self.target = target
+        self.labels = labels
+        self.progress_error = progress_error
+        self.distance = float(np.max(np.abs(target - start)))
+        self.travelled = 0.0
+        self.speed = 0.0
+        self.paused = False
+        self.started_at = self.updated_at = self.window_started_at = now
+        self.window_error = np.abs(target - start)
+        self.stall_time = np.zeros(len(start))
+
+    @property
+    def progress(self):
+        return self.travelled / self.distance if self.distance else 1.0
+
+    @property
+    def command(self):
+        return linear_interpolate(self.start, self.target, self.progress)
+
+    def advance(self, measured, received, now):
+        dt = min(now - self.updated_at, self.MAX_TIMESTEP)
+        self.updated_at = now
+        if self.progress >= 1.0:
+            return
+        if now - self.started_at >= self.TIMEOUT:
+            raise RuntimeError("Initialization trajectory timed out")
+        if not received:
+            # Hold the last command until a complete fresh set of feedback arrives.
+            self.speed = 0.0
+            self.window_started_at = now
+            self.window_error = None
+            self.stall_time.fill(0.0)
+            return
+
+        tracking_error = np.abs(self.command - measured)
+        goal_error = np.abs(self.target - measured)
+        if self.window_error is None:
+            self.window_error = goal_error
+            self.window_started_at = now
+        window = now - self.window_started_at
+        if window >= self.PROGRESS_WINDOW:
+            improvement = self.window_error - goal_error
+            outside_goal = goal_error > self.progress_error
+            wrong_way = np.flatnonzero(outside_goal & (improvement < -0.02))
+            if wrong_way.size:
+                raise RuntimeError(f"{self.labels[wrong_way[0]]}: moving away from initialization target")
+            stalled = outside_goal & (tracking_error > self.progress_error) & (improvement < 0.003)
+            self.stall_time = np.where(stalled, self.stall_time + window, 0.0)
+            timed_out = np.flatnonzero(self.stall_time >= self.STALL_TIMEOUT)
+            if timed_out.size:
+                raise RuntimeError(f"{self.labels[timed_out[0]]}: initialization stalled")
+            self.window_error = goal_error
+            self.window_started_at = now
+
+        pause_error = self.RESUME_ERROR if self.paused else self.PAUSE_ERROR
+        self.paused = float(np.max(tracking_error)) > pause_error
+        self._advance_reference(dt)
+
+    def _advance_reference(self, dt):
+        # All joints share one progress value. The longest travel sets the limits.
+        acceleration = self.MAX_ACCELERATION
+        if self.paused:
+            phases = ((-acceleration, self.speed / acceleration),)
+        else:
+            remaining = self.distance - self.travelled
+            peak = min(self.MAX_SPEED, math.sqrt(acceleration * remaining + self.speed**2 / 2))
+            peak = max(self.speed, peak)
+            accelerate = (peak - self.speed) / acceleration
+            brake = peak / acceleration
+            cruise = max(0.0, (remaining - (self.speed + peak) * accelerate / 2 - peak * brake / 2) / peak)
+            phases = ((acceleration, accelerate), (0.0, cruise), (-acceleration, brake))
+        for rate, duration in phases:
+            step = min(dt, duration)
+            self.travelled += (self.speed + rate * step / 2) * step
+            self.speed = max(0.0, self.speed + rate * step)
+            dt -= step
+        if self.distance - self.travelled < 1e-9:
+            self.travelled = self.distance
+            self.speed = 0.0
+
+
 class Humanoid:
     # The firmware divides motor-shaft angles by this signed gearbox ratio.
     JOINT_GEAR_RATIO = -15.0
-    INIT_DURATION = 4.0
     INIT_SETTLING_TIMEOUT = 2.0
-    INIT_FINAL_TOLERANCE = 0.05
     INIT_STABLE_SAMPLES = 3
+    INIT_SETTLING_VELOCITY = 0.05
+    INIT_STABLE_TIME = 0.2
     INIT_MAX_TRAVEL = 0.5
     INIT_MAX_SAMPLE_SPREAD = 0.03
     INIT_MAX_POSITION_STEP = 0.20
@@ -123,12 +230,13 @@ class Humanoid:
         self.joint_velocity_measured = np.zeros(len(self.joints), dtype=np.float32)
 
         # used for RL initialization controller
-        self.init_percentage = 0.0
         self.starting_positions = np.zeros_like(self.joint_position_target, dtype=np.float32)
         self.init_ready = False
         self.init_failed = False
-        self._init_started_at = 0.0
+        self._init_ramp = None
+        self._init_feedback_complete = False
         self._init_settling_at = None
+        self._init_stable_since = None
         self._init_stable_samples = 0
         self._init_timeouts = np.zeros(len(self.joints), dtype=int)
         self._init_previous_positions = self.starting_positions.copy()
@@ -204,14 +312,83 @@ class Humanoid:
                 time.sleep(0.001)
                 bus.write_torque_limit(device_id, self.torque_limit[i])
                 time.sleep(0.001)
+                self._verify_initialization_parameters(i)
                 bus.feed(device_id)
                 bus.set_mode(device_id, recoil.Mode.DAMPING)
+                mode = self._read_init_parameter(i, recoil.Parameter.MODE, timeout=0.02, integer=True)
+                if mode != recoil.Mode.DAMPING:
+                    raise RuntimeError(f"DAMPING mode rejected (mode=0x{mode:02x})")
             except Exception as error:
                 raise RuntimeError(
                     f"{bus.channel} ID {device_id} ({joint_name}): {error}"
                 ) from error
 
         print("Motors enabled")
+
+    def _read_init_parameter(self, joint_id, parameter, timeout, integer=False):
+        bus, device_id, _ = self.joints[joint_id]
+        read = bus._read_parameter_u32 if integer else bus._read_parameter_f32
+        value = read(device_id, parameter, timeout=timeout)
+        if value is None or not math.isfinite(value):
+            raise TimeoutError(f"{self._joint_label(joint_id)}: no valid readback for parameter 0x{parameter:03x}")
+        return value
+
+    def _verify_initialization_parameters(self, joint_id):
+        parameter = recoil.Parameter
+        fields = (
+            ("kp", parameter.POSITION_CONTROLLER_POSITION_KP, self.joint_kp[joint_id]),
+            ("kd", parameter.POSITION_CONTROLLER_VELOCITY_KP, self.joint_kd[joint_id]),
+            ("torque_limit", parameter.POSITION_CONTROLLER_TORQUE_LIMIT, self.torque_limit[joint_id]),
+            ("ki", parameter.POSITION_CONTROLLER_POSITION_KI, None),
+            ("torque_filter_alpha", parameter.POSITION_CONTROLLER_TORQUE_FILTER_ALPHA, None),
+        )
+        values = []
+        for name, address, expected in fields:
+            value = self._read_init_parameter(joint_id, address, timeout=0.1)
+            if expected is not None and not math.isclose(value, expected, rel_tol=1e-5):
+                raise RuntimeError(f"{self._joint_label(joint_id)}: {name}={value:g}, expected {expected:g}")
+            values.append(f"{name}={value:g}")
+        print("  Drive readback: " + ", ".join(values))
+
+    def enter_initialization_position_mode(self, group):
+        for joint_id in group:
+            bus, device_id, _ = self.joints[joint_id]
+            bus.feed(device_id)
+            bus.set_mode(device_id, recoil.Mode.POSITION)
+            mode = self._read_init_parameter(joint_id, recoil.Parameter.MODE, timeout=0.02, integer=True)
+            if mode != recoil.Mode.POSITION:
+                raise RuntimeError(f"{self._joint_label(joint_id)}: POSITION mode rejected (mode=0x{mode:02x})")
+        self._init_diagnostic_at = time.monotonic()
+        self._init_diagnostic_index = 0
+
+    def log_initialization_feedback(self, group, commands, positions, velocities):
+        now = time.monotonic()
+        if now < self._init_diagnostic_at:
+            return
+        joint_id = group[self._init_diagnostic_index]
+        self._init_diagnostic_index = (self._init_diagnostic_index + 1) % len(group)
+        self._init_diagnostic_at = now + 0.1
+        parameter = recoil.Parameter
+        try:
+            mode = self._read_init_parameter(joint_id, parameter.MODE, timeout=0.005, integer=True)
+            if mode != recoil.Mode.POSITION:
+                raise RuntimeError(f"{self._joint_label(joint_id)}: lost POSITION (mode=0x{mode:02x})")
+            fault = self._read_init_parameter(joint_id, parameter.ERROR, timeout=0.005, integer=True)
+            torque = self._read_init_parameter(joint_id, parameter.POSITION_CONTROLLER_TORQUE_SETPOINT, timeout=0.005)
+            measured = self._read_init_parameter(joint_id, parameter.POSITION_CONTROLLER_TORQUE_MEASURED, timeout=0.005)
+        except (TimeoutError, IndexError):
+            # SDO replies do not identify the register. End this sample on the
+            # first failed read, so a late reply cannot be used for its next field.
+            print(f"[init] {self._joint_label(joint_id)}: drive diagnostics unavailable")
+            return
+        direction = self.joint_axis_directions[joint_id]
+        print(f"[init] {self._joint_label(joint_id)} "
+              f"cmd={commands[joint_id]:+.3f} pos={positions[joint_id]:+.3f} "
+              f"track_err={commands[joint_id] - positions[joint_id]:+.3f} "
+              f"goal_err={self.rl_init_positions[joint_id] - positions[joint_id]:+.3f} "
+              f"vel={velocities[joint_id]:+.3f} rad/s "
+              f"torque_set={direction * torque:+.2f} torque_est={direction * measured:+.2f} N*m "
+              f"mode=0x{mode:02x} fault=0x{fault:04x}")
 
     def stop(self):
         if self.imu is not None:
@@ -277,19 +454,7 @@ class Humanoid:
         for joint_id in (joint_id_l, joint_id_r):
             bus, device_id, _ = self.joints[joint_id]
             if self.state == State.RL_INIT:
-                # Do not mistake a late parameter reply for position feedback.
-                frame = bus.receive(
-                    filter_device_id=device_id,
-                    filter_function=recoil.Function.TRANSMIT_PDO_2,
-                    timeout=0.001,
-                )
-                if frame is None:
-                    received.append(False)
-                    continue
-                feedback = bus.unpack("<ff", frame.data)
-                if len(feedback) != 2 or not all(math.isfinite(value) for value in feedback):
-                    raise RuntimeError(f"{self._joint_label(joint_id)}: invalid PDO feedback")
-                position, velocity = feedback
+                position, velocity = receive_initialization_feedback(bus, device_id)
             else:
                 position, velocity = bus.receive_pdo_2(device_id)
 
@@ -361,8 +526,8 @@ class Humanoid:
     def _start_initialization(self):
         self.init_ready = False
         self.init_failed = False
-        self.init_percentage = 0.0
         self._init_settling_at = None
+        self._init_stable_since = None
         self._init_stable_samples = 0
         self._init_timeouts.fill(0)
         self.check_initialization_configuration()
@@ -395,19 +560,23 @@ class Humanoid:
             if not received[joint_id]:
                 raise RuntimeError(f"{self._joint_label(joint_id)}: no PDO feedback while preloading targets")
             if (abs(self.joint_position_measured[joint_id] - self.starting_positions[joint_id]) > self.INIT_MAX_SAMPLE_SPREAD
-                    or abs(self.joint_velocity_measured[joint_id]) > self.INIT_MAX_VELOCITY):
+                    or abs(self.joint_velocity_measured[joint_id]) > self.INIT_SETTLING_VELOCITY):
                 raise RuntimeError(f"{self._joint_label(joint_id)}: joint moved during preflight")
         self._init_previous_positions = self.joint_position_measured.copy()
+        self._init_feedback_complete = True
         # Honor a cancel pressed while the preflight reads were in progress.
         if self.command_controller.commands["mode_switch"] == State.IDLE:
             self.state = State.IDLE
             print("Initialization cancelled before entering position mode.")
             return
-        for bus, device_id, _ in self.joints:
-            bus.feed(device_id)
-            bus.set_mode(device_id, recoil.Mode.POSITION)
-        self._init_started_at = time.monotonic()
-        print(f"Initializing over {self.INIT_DURATION:.1f} s; then checking arrival for up to {self.INIT_SETTLING_TIMEOUT:.1f} s.")
+        self.enter_initialization_position_mode(range(len(self.joints)))
+        self._init_ramp = InitializationRamp(
+            self.starting_positions, self.rl_init_positions,
+            [self._joint_label(joint_id) for joint_id in range(len(self.joints))],
+            InitializationRamp.RESUME_ERROR, time.monotonic(),
+        )
+        print(f"Initializing at up to {self._init_ramp.MAX_SPEED:.2f} rad/s reference speed, "
+              f"with {self._init_ramp.TIMEOUT:g} s trajectory timeout.")
 
     def _fail_initialization(self, reason):
         self.state = State.RL_INIT
@@ -442,29 +611,40 @@ class Humanoid:
                 raise RuntimeError(f"{label}: tracking error={errors[joint_id]:+.3f} rad")
             self._init_previous_positions[joint_id] = self.joint_position_measured[joint_id]
 
-        if self.init_percentage < 1.0:
+        if self._init_ramp.progress < 1.0:
             return
         now = time.monotonic()
         if self._init_settling_at is None:
             self._init_settling_at = now
-        # Retained values from a missing reply must never count as arrival.
-        at_target = received.all() and np.all(np.abs(errors) <= self.INIT_FINAL_TOLERANCE)
-        self._init_stable_samples = self._init_stable_samples + 1 if at_target else 0
-        if (self._init_stable_samples >= self.INIT_STABLE_SAMPLES
+        # RL readiness requires fresh, slow feedback after the ramp.
+        # Position error is reported here and guarded by the tracking limit above.
+        settled_joints = received & (np.abs(self.joint_velocity_measured) <= self.INIT_SETTLING_VELOCITY)
+        settled = settled_joints.all()
+        self._init_stable_samples = self._init_stable_samples + 1 if settled else 0
+        if not settled:
+            self._init_stable_since = None
+        elif self._init_stable_since is None:
+            self._init_stable_since = now
+        if (self._initialization_is_stable(now)
                 and (self.init_ready or now - self._init_settling_at <= self.INIT_SETTLING_TIMEOUT)):
             if not self.init_ready:
-                print(f"Initialization PASSED: max error={np.max(np.abs(errors)):.3f} rad. "
+                print(f"Initialization ready: max residual position error={np.max(np.abs(errors)):.3f} rad. "
                       "Holding target positions; use the RL running command when ready.")
             self.init_ready = True
         elif not self.init_ready and now - self._init_settling_at >= self.INIT_SETTLING_TIMEOUT:
             details = "; ".join(
-                f"{self._joint_label(joint_id)}: error={errors[joint_id]:+.3f} rad"
-                + (" (no PDO reply)" if not received[joint_id] else "")
-                for joint_id in range(len(self.joints))
-                if not received[joint_id] or abs(errors[joint_id]) > self.INIT_FINAL_TOLERANCE
+                f"{self._joint_label(joint_id)}: "
+                + (f"velocity={self.joint_velocity_measured[joint_id]:+.3f} rad/s"
+                   if received[joint_id] else "no PDO reply")
+                for joint_id in np.flatnonzero(~settled_joints)
             )
-            raise RuntimeError(f"Arrival timeout: need {self.INIT_STABLE_SAMPLES} consecutive frames "
-                               f"within {self.INIT_FINAL_TOLERANCE:.3f} rad. {details}")
+            raise RuntimeError(f"Settling timeout: need fresh feedback for {self.INIT_STABLE_TIME:.1f} s "
+                               f"at or below {self.INIT_SETTLING_VELOCITY:.3f} rad/s. {details}")
+
+    def _initialization_is_stable(self, now):
+        return (self._init_stable_samples >= self.INIT_STABLE_SAMPLES
+                and self._init_stable_since is not None
+                and now - self._init_stable_since >= self.INIT_STABLE_TIME)
 
     def step(self, actions: np.ndarray):
         """
@@ -498,10 +678,6 @@ class Humanoid:
                         self._fail_initialization(error)
                     return self.get_observations()
 
-                if not self.init_failed:
-                    self.init_percentage = min((time.monotonic() - self._init_started_at) / self.INIT_DURATION, 1.0)
-                    self.joint_position_target[:] = linear_interpolate(self.starting_positions, self.rl_init_positions, self.init_percentage)
-
             case State.RL_RUNNING:
                 for i in range(len(self.joints)):
                     self.joint_position_target[i] = actions[i]
@@ -517,9 +693,22 @@ class Humanoid:
         if self.state == State.RL_INIT:
             if not self.init_failed:
                 try:
+                    if self._init_ramp.progress < 1.0:
+                        self._init_ramp.advance(
+                            self.joint_position_measured, self._init_feedback_complete,
+                            time.monotonic(),
+                        )
+                        self.joint_position_target[:] = self._init_ramp.command
                     received = self.update_joints()
+                    self._init_feedback_complete = received.all()
                     self._check_initialization_feedback(received)
-                    if (self.init_ready and self._init_stable_samples >= self.INIT_STABLE_SAMPLES
+                    if self._init_feedback_complete:
+                        self.log_initialization_feedback(
+                            range(len(self.joints)), self.joint_position_target,
+                            self.joint_position_measured, self.joint_velocity_measured,
+                        )
+                    now = time.monotonic()
+                    if (self.init_ready and self._initialization_is_stable(now)
                             and self.command_controller.commands["mode_switch"] == State.RL_RUNNING):
                         print("Switching to RL running mode")
                         self.state = State.RL_RUNNING
