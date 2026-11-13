@@ -8,8 +8,13 @@ supporting both gamepad and keyboard input devices. It handles command broadcast
 over UDP for robot control modes and movement velocities.
 """
 
+import struct
+import sys
 import threading
 from typing import Dict
+
+if sys.platform == "linux":
+    import fcntl
 
 from inputs import UnpluggedError, get_gamepad
 
@@ -78,6 +83,11 @@ XIAOJI_EVENT_REMAP = {
 }
 
 
+# Linux EV_ABS codes for the three raw stick axes used by this mapping.
+LINUX_STICK_AXIS_CODES = {"ABS_X": 0, "ABS_Y": 1, "ABS_Z": 2}
+LINUX_ABS_INFO = struct.Struct("=6i")
+
+
 class Se2Gamepad:
     def __init__(self,
                  stick_sensitivity: float = 1.0,
@@ -102,6 +112,7 @@ class Se2Gamepad:
     def reset(self) -> None:
         self._states = {key: 0 for key in XInputEntry.__dict__.values()}
         self._last_mode_switch = 0
+        self._stick_axis_limits: dict[str, tuple[int, int, int]] = {}
 
     def stop(self) -> None:
         print("Gamepad stopping...")
@@ -125,21 +136,42 @@ class Se2Gamepad:
         # update all events from the joystick
         for event in events:
             mapped_code = XIAOJI_EVENT_REMAP.get(event.code, event.code)
-            self._states[mapped_code] = event.state
+            state = event.state
+            if mapped_code in (XInputEntry.AXIS_Y_L, XInputEntry.AXIS_X_R, XInputEntry.AXIS_X_L):
+                state = self._normalize_stick_axis(event)
+            self._states[mapped_code] = state
 
         self._update_command_buffer()
 
-    def _update_command_buffer(self) -> Dict[str, float]:
-        velocity_x = self._states.get(XInputEntry.AXIS_Y_L)
-        velocity_y = self._states.get(XInputEntry.AXIS_X_R)
-        velocity_yaw = self._states.get(XInputEntry.AXIS_X_L)
+    def _normalize_stick_axis(self, event) -> float:
+        if sys.platform != "linux":
+            return event.state / 32768.0
 
-        if velocity_x is not None:
-            self.commands["velocity_x"] = velocity_x / -32768.0
-        if velocity_y is not None:
-            self.commands["velocity_y"] = velocity_y / -32768.0
-        if velocity_yaw is not None:
-            self.commands["velocity_yaw"] = velocity_yaw / -32768.0
+        if event.code not in self._stick_axis_limits:
+            # EVIOCGABS uses the original axis code, before the Xiaoji remap.
+            axis = LINUX_STICK_AXIS_CODES[event.code]
+            request = 0x80000000 | (LINUX_ABS_INFO.size << 16) | (ord("E") << 8) | (0x40 + axis)
+            try:
+                with open(event.device.get_char_device_path(), "rb") as device:
+                    info = fcntl.ioctl(device, request, bytes(LINUX_ABS_INFO.size))
+                _, minimum, maximum, _, flat, _ = LINUX_ABS_INFO.unpack(info)
+            except OSError:
+                return event.state / 32768.0
+            self._stick_axis_limits[event.code] = minimum, maximum, flat
+
+        minimum, maximum, flat = self._stick_axis_limits[event.code]
+        center = (minimum + maximum + 1) // 2
+        offset = event.state - center
+        if abs(offset) <= flat:
+            return 0.0
+        half_range = center - minimum if offset < 0 else maximum - center
+        magnitude = min(1.0, (abs(offset) - flat) / max(half_range - flat, 1))
+        return -magnitude if offset < 0 else magnitude
+
+    def _update_command_buffer(self) -> Dict[str, float]:
+        self.commands["velocity_x"] = -self._states[XInputEntry.AXIS_Y_L]
+        self.commands["velocity_y"] = -self._states[XInputEntry.AXIS_X_R]
+        self.commands["velocity_yaw"] = -self._states[XInputEntry.AXIS_X_L]
 
         mode_switch = 0
 
