@@ -366,16 +366,22 @@ class Humanoid:
             mode = self._read_init_parameter(joint_id, recoil.Parameter.MODE, timeout=0.02, integer=True)
             if mode != recoil.Mode.POSITION:
                 raise RuntimeError(f"{self._joint_label(joint_id)}: POSITION mode rejected (mode=0x{mode:02x})")
-        self._init_diagnostic_at = time.monotonic()
-        self._init_diagnostic_index = 0
+        self._joint_diagnostic_at = time.monotonic()
+        self._joint_diagnostic_index = 0
 
-    def log_initialization_feedback(self, group, commands, positions, velocities):
+    def _next_diagnostic_joint(self, group):
         now = time.monotonic()
-        if now < self._init_diagnostic_at:
+        if now < self._joint_diagnostic_at:
+            return None
+        joint_id = group[self._joint_diagnostic_index]
+        self._joint_diagnostic_index = (self._joint_diagnostic_index + 1) % len(group)
+        self._joint_diagnostic_at = now + 0.1
+        return joint_id
+
+    def log_initialization_feedback(self, group, commands, positions, velocities, *, print_feedback=True):
+        joint_id = self._next_diagnostic_joint(group)
+        if joint_id is None:
             return
-        joint_id = group[self._init_diagnostic_index]
-        self._init_diagnostic_index = (self._init_diagnostic_index + 1) % len(group)
-        self._init_diagnostic_at = now + 0.1
         parameter = recoil.Parameter
         try:
             mode = self._read_init_parameter(joint_id, parameter.MODE, timeout=0.005, integer=True)
@@ -387,7 +393,10 @@ class Humanoid:
         except (TimeoutError, IndexError):
             # SDO replies do not identify the register. End this sample on the
             # first failed read, so a late reply cannot be used for its next field.
-            print(f"[init] {self._joint_label(joint_id)}: drive diagnostics unavailable")
+            if print_feedback:
+                print(f"[init] {self._joint_label(joint_id)}: drive diagnostics unavailable")
+            return
+        if not print_feedback:
             return
         direction = self.joint_axis_directions[joint_id]
         print(f"[init] {self._joint_label(joint_id)} "
@@ -397,6 +406,12 @@ class Humanoid:
               f"vel={velocities[joint_id]:+.3f} rad/s "
               f"torque_set={direction * torque:+.2f} torque_est={direction * measured:+.2f} N*m "
               f"mode=0x{mode:02x} fault=0x{fault:04x}")
+
+    def _log_rl_joint_velocity(self, received):
+        joint_id = self._next_diagnostic_joint(range(len(self.joints)))
+        if joint_id is not None and received[joint_id]:
+            velocity = self.joint_velocity_measured[joint_id]
+            print(f"[rl] {self._joint_label(joint_id)} vel={velocity:+.3f} rad/s")
 
     def stop(self):
         if self.imu is not None:
@@ -743,6 +758,7 @@ class Humanoid:
                         self.log_initialization_feedback(
                             range(len(self.joints)), self.joint_position_target,
                             self.joint_position_measured, self.joint_velocity_measured,
+                            print_feedback=not self.init_ready,
                         )
                     if (self.init_ready and settled
                             and self.command_controller.commands["mode_switch"] == State.RL_RUNNING):
@@ -751,7 +767,9 @@ class Humanoid:
                 except Exception as error:
                     self._fail_initialization(error)
         else:
-            self.update_joints()
+            received = self.update_joints()
+            if self.state == State.RL_RUNNING:
+                self._log_rl_joint_velocity(received)
 
         obs = self.get_observations()
 
