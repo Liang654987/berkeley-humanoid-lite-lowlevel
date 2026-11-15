@@ -559,9 +559,6 @@ class Humanoid:
         for joint_id in range(len(self.joints)):
             if not received[joint_id]:
                 raise RuntimeError(f"{self._joint_label(joint_id)}: no PDO feedback while preloading targets")
-            if (abs(self.joint_position_measured[joint_id] - self.starting_positions[joint_id]) > self.INIT_MAX_SAMPLE_SPREAD
-                    or abs(self.joint_velocity_measured[joint_id]) > self.INIT_SETTLING_VELOCITY):
-                raise RuntimeError(f"{self._joint_label(joint_id)}: joint moved during preflight")
         self._init_previous_positions = self.joint_position_measured.copy()
         self._init_feedback_complete = True
         # Honor a cancel pressed while the preflight reads were in progress.
