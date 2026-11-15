@@ -2,6 +2,7 @@
 
 import math
 import time
+from collections import deque
 from pathlib import Path
 
 from omegaconf import OmegaConf
@@ -139,7 +140,7 @@ class InitializationRamp:
 class Humanoid:
     # The firmware divides motor-shaft angles by this signed gearbox ratio.
     JOINT_GEAR_RATIO = -15.0
-    INIT_SETTLING_TIMEOUT = 2.0
+    INIT_SETTLING_TIMEOUT = 4.0
     INIT_STABLE_SAMPLES = 3
     INIT_SETTLING_VELOCITY = 0.05
     INIT_STABLE_TIME = 0.2
@@ -236,8 +237,7 @@ class Humanoid:
         self._init_ramp = None
         self._init_feedback_complete = False
         self._init_settling_at = None
-        self._init_stable_since = None
-        self._init_stable_samples = 0
+        self._init_settling_samples: deque[tuple[float, np.ndarray]] = deque()
         self._init_timeouts = np.zeros(len(self.joints), dtype=int)
         self._init_previous_positions = self.starting_positions.copy()
 
@@ -527,8 +527,7 @@ class Humanoid:
         self.init_ready = False
         self.init_failed = False
         self._init_settling_at = None
-        self._init_stable_since = None
-        self._init_stable_samples = 0
+        self._init_settling_samples.clear()
         self._init_timeouts.fill(0)
         self.check_initialization_configuration()
         self.check_gear_ratios()
@@ -588,7 +587,30 @@ class Humanoid:
                 print(f"DAMPING send failed for {bus.channel} ID {device_id}: {error}")
         print("DAMPING requested for all joints. RL running is blocked; select idle before retrying initialization.")
 
-    def _check_initialization_feedback(self, received):
+    def _initialization_window_speeds(self, now, received_all):
+        samples = self._init_settling_samples
+        if not received_all:
+            samples.clear()
+            return None
+        if samples and now - samples[-1][0] >= self.INIT_STABLE_TIME:
+            # A gap spanning the whole window cannot establish stability.
+            samples.clear()
+        samples.append((now, self.joint_position_measured.copy()))
+
+        # Keep the latest full window, including its nearest sample at or before
+        # the time boundary and at least the required number of samples.
+        while (len(samples) > self.INIT_STABLE_SAMPLES
+               and now - samples[1][0] >= self.INIT_STABLE_TIME):
+            samples.popleft()
+        duration = now - samples[0][0]
+        if len(samples) < self.INIT_STABLE_SAMPLES or duration < self.INIT_STABLE_TIME:
+            return None
+
+        positions = np.stack([position for _, position in samples])
+        # Sum absolute movement so that motion in opposite directions adds up.
+        return np.abs(np.diff(positions, axis=0)).sum(axis=0) / duration
+
+    def _check_initialization_feedback(self, received) -> bool:
         self._init_timeouts[received] = 0
         self._init_timeouts[~received] += 1
         errors = self.joint_position_target - self.joint_position_measured
@@ -609,39 +631,44 @@ class Humanoid:
             self._init_previous_positions[joint_id] = self.joint_position_measured[joint_id]
 
         if self._init_ramp.progress < 1.0:
-            return
+            return False
         now = time.monotonic()
         if self._init_settling_at is None:
             self._init_settling_at = now
-        # RL readiness requires fresh, slow feedback after the ramp.
-        # Position error is reported here and guarded by the tracking limit above.
-        settled_joints = received & (np.abs(self.joint_velocity_measured) <= self.INIT_SETTLING_VELOCITY)
-        settled = settled_joints.all()
-        self._init_stable_samples = self._init_stable_samples + 1 if settled else 0
-        if not settled:
-            self._init_stable_since = None
-        elif self._init_stable_since is None:
-            self._init_stable_since = now
-        if (self._initialization_is_stable(now)
-                and (self.init_ready or now - self._init_settling_at <= self.INIT_SETTLING_TIMEOUT)):
-            if not self.init_ready:
-                print(f"Initialization ready: max residual position error={np.max(np.abs(errors)):.3f} rad. "
-                      "Holding target positions; use the RL running command when ready.")
-            self.init_ready = True
-        elif not self.init_ready and now - self._init_settling_at >= self.INIT_SETTLING_TIMEOUT:
-            details = "; ".join(
-                f"{self._joint_label(joint_id)}: "
-                + (f"velocity={self.joint_velocity_measured[joint_id]:+.3f} rad/s"
-                   if received[joint_id] else "no PDO reply")
-                for joint_id in np.flatnonzero(~settled_joints)
-            )
-            raise RuntimeError(f"Settling timeout: need fresh feedback for {self.INIT_STABLE_TIME:.1f} s "
-                               f"at or below {self.INIT_SETTLING_VELOCITY:.3f} rad/s. {details}")
 
-    def _initialization_is_stable(self, now):
-        return (self._init_stable_samples >= self.INIT_STABLE_SAMPLES
-                and self._init_stable_since is not None
-                and now - self._init_stable_since >= self.INIT_STABLE_TIME)
+        received_all = received.all()
+        window_speeds = self._initialization_window_speeds(now, received_all)
+        settled = window_speeds is not None and bool((window_speeds <= self.INIT_SETTLING_VELOCITY).all())
+        if self.init_ready:
+            return settled
+
+        elapsed = now - self._init_settling_at
+        if settled and elapsed <= self.INIT_SETTLING_TIMEOUT:
+            print(f"Initialization ready: max residual position error={np.max(np.abs(errors)):.3f} rad. "
+                  "Holding target positions; use the RL running command when ready.")
+            self.init_ready = True
+            return True
+        if elapsed >= self.INIT_SETTLING_TIMEOUT:
+            if not received_all:
+                details = "; ".join(
+                    f"{self._joint_label(joint_id)}: no PDO reply"
+                    for joint_id in np.flatnonzero(~received)
+                )
+            elif window_speeds is None:
+                details = "not enough consecutive complete PDO feedback"
+            elif settled:
+                details = "stability window completed after the timeout"
+            else:
+                details = "; ".join(
+                    f"{self._joint_label(joint_id)}: mean speed={window_speeds[joint_id]:.3f} rad/s"
+                    for joint_id in np.flatnonzero(window_speeds > self.INIT_SETTLING_VELOCITY)
+                )
+            raise RuntimeError(
+                f"Settling timeout after {self.INIT_SETTLING_TIMEOUT:.1f} s: need a "
+                f"{self.INIT_STABLE_TIME:.1f} s feedback window with mean joint speed "
+                f"at or below {self.INIT_SETTLING_VELOCITY:.3f} rad/s. {details}"
+            )
+        return False
 
     def step(self, actions: np.ndarray):
         """
@@ -698,14 +725,13 @@ class Humanoid:
                         self.joint_position_target[:] = self._init_ramp.command
                     received = self.update_joints()
                     self._init_feedback_complete = received.all()
-                    self._check_initialization_feedback(received)
+                    settled = self._check_initialization_feedback(received)
                     if self._init_feedback_complete:
                         self.log_initialization_feedback(
                             range(len(self.joints)), self.joint_position_target,
                             self.joint_position_measured, self.joint_velocity_measured,
                         )
-                    now = time.monotonic()
-                    if (self.init_ready and self._initialization_is_stable(now)
+                    if (self.init_ready and settled
                             and self.command_controller.commands["mode_switch"] == State.RL_RUNNING):
                         print("Switching to RL running mode")
                         self.state = State.RL_RUNNING
