@@ -54,7 +54,8 @@ class InitializationRamp:
     STALL_TIMEOUT = 2.0
     TIMEOUT = 30.0
 
-    def __init__(self, start, target, labels, progress_error, now):
+    def __init__(self, start, target, labels, progress_error, now, *,
+                 stall_and_pause_exempt_indices: tuple[int, ...] = ()):
         self.start = start
         self.target = target
         self.labels = labels
@@ -66,6 +67,8 @@ class InitializationRamp:
         self.started_at = self.updated_at = self.window_started_at = now
         self.window_error = np.abs(target - start)
         self.stall_time = np.zeros(len(start))
+        self.stall_and_pause_enabled = np.ones(len(start), dtype=bool)
+        self.stall_and_pause_enabled[list(stall_and_pause_exempt_indices)] = False
 
     @property
     def progress(self):
@@ -102,7 +105,8 @@ class InitializationRamp:
             wrong_way = np.flatnonzero(outside_goal & (improvement < -0.02))
             if wrong_way.size:
                 raise RuntimeError(f"{self.labels[wrong_way[0]]}: moving away from initialization target")
-            stalled = outside_goal & (tracking_error > self.progress_error) & (improvement < 0.003)
+            stalled = (self.stall_and_pause_enabled & outside_goal
+                       & (tracking_error > self.progress_error) & (improvement < 0.003))
             self.stall_time = np.where(stalled, self.stall_time + window, 0.0)
             timed_out = np.flatnonzero(self.stall_time >= self.STALL_TIMEOUT)
             if timed_out.size:
@@ -111,7 +115,7 @@ class InitializationRamp:
             self.window_started_at = now
 
         pause_error = self.RESUME_ERROR if self.paused else self.PAUSE_ERROR
-        self.paused = float(np.max(tracking_error)) > pause_error
+        self.paused = bool(np.any(self.stall_and_pause_enabled & (tracking_error > pause_error)))
         self._advance_reference(dt)
 
     def _advance_reference(self, dt):
@@ -150,6 +154,10 @@ class Humanoid:
     INIT_MAX_VELOCITY = 1.0
     INIT_MAX_TRACKING_ERROR = 0.15
     INIT_CAN_TIMEOUT_LIMIT = 10
+    INIT_STALL_AND_PAUSE_EXEMPT_JOINTS = frozenset({
+        ("can2", 1), ("can2", 3),
+        ("can3", 2), ("can3", 4),
+    })
 
     def __init__(self, start_peripherals: bool = True):
 
@@ -566,10 +574,15 @@ class Humanoid:
             print("Initialization cancelled before entering position mode.")
             return
         self.enter_initialization_position_mode(range(len(self.joints)))
+        stall_and_pause_exempt_indices = tuple(
+            joint_id for joint_id, (bus, device_id, _) in enumerate(self.joints)
+            if (bus.channel, device_id) in self.INIT_STALL_AND_PAUSE_EXEMPT_JOINTS
+        )
         self._init_ramp = InitializationRamp(
             self.starting_positions, self.rl_init_positions,
             [self._joint_label(joint_id) for joint_id in range(len(self.joints))],
             InitializationRamp.RESUME_ERROR, time.monotonic(),
+            stall_and_pause_exempt_indices=stall_and_pause_exempt_indices,
         )
         print(f"Initializing at up to {self._init_ramp.MAX_SPEED:.2f} rad/s reference speed, "
               f"with {self._init_ramp.TIMEOUT:g} s trajectory timeout.")
