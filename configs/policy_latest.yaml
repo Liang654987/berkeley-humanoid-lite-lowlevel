@@ -1,4 +1,4 @@
-policy_checkpoint_path: /home/robot/Berkeley-Humanoid-Lite/logs/rsl_rl/biped/2026-11-14_12-30-43/exported/policy.onnx
+policy_checkpoint_path: checkpoints/policy_biped_2026-11-14_12-30-43.onnx
 ip_robot_addr: 127.0.0.1
 ip_policy_obs_port: 10000
 ip_host_addr: 127.0.0.1
